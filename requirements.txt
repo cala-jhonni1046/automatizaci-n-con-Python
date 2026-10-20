@@ -1,0 +1,16 @@
+# Cerebro: una sola librería para hablar con Gemini, Claude y otras IAs
+litellm>=1.70
+python-dotenv>=1.0
+
+# Control de la computadora
+pyautogui>=0.9.54
+pyperclip>=1.9
+
+# Oído y voz
+SpeechRecognition>=3.10
+pyaudio>=0.2.14
+pyttsx3>=2.90
+
+# Opcional: voz más natural (JARVIS_MOTOR_VOZ=edge)
+edge-tts>=6.1
+pygame>=2.5
