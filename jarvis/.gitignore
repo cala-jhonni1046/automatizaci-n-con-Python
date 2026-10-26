@@ -1,0 +1,8 @@
+.env
+contactos.json
+jarvis.log
+__pycache__/
+*.pyc
+.venv/
+.venv-win/
+venv/
