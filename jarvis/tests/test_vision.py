@@ -70,13 +70,18 @@ def test_esquemas_para_litellm_no_cambian():
         assert esquema["function"]["parameters"]["type"] == "object"
 
 
+def _texto_instrucciones(config: types.LiveConnectConfig) -> str:
+    assert isinstance(config.system_instruction, types.Content)
+    return config.system_instruction.parts[0].text
+
+
 def test_configuracion_con_y_sin_herramientas():
     con = nueva_vision().configuracion()
     assert con.tools and con.tools[0].function_declarations
-    assert "NUNCA digas que hiciste algo" in con.system_instruction
+    assert "NUNCA digas que hiciste algo" in _texto_instrucciones(con)
     sin = nueva_vision(con_herramientas=False).configuracion()
     assert sin.tools is None
-    assert "herramientas" not in sin.system_instruction
+    assert "herramientas" not in _texto_instrucciones(sin)
 
 
 # ---------------------------------------------------------------- llamadas a función
@@ -233,6 +238,14 @@ def test_las_lentas_son_no_bloqueantes_y_el_resto_bloqueante():
     comportamiento = {d.name: d.behavior for d in tool.function_declarations}
     assert comportamiento.pop("buscar_archivos") == types.Behavior.NON_BLOCKING
     assert comportamiento.pop("ejecutar_comando") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("investigar_a_fondo") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("leer_video_youtube") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("ejecutar_wsl") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("ejecutar_ssh_vm") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("inspeccionar_pantalla_hd") == types.Behavior.NON_BLOCKING
+    assert comportamiento.pop("diagnosticar_y_resolver_con_certeza") == types.Behavior.NON_BLOCKING
+    for lenta in ("consultar_gemini_pro", "explicar_codigo_en_pantalla", "analizar_repositorio_con_gemini"):
+        assert comportamiento.pop(lenta) == types.Behavior.NON_BLOCKING
     assert set(comportamiento.values()) == {types.Behavior.BLOCKING}
 
 
@@ -304,14 +317,14 @@ def test_busqueda_de_google_junto_a_las_funciones():
     tools = v.herramientas_genai()
     assert tools[0].function_declarations
     assert tools[-1].google_search is not None
-    assert "buscar en Google" in v.configuracion().system_instruction
+    assert "buscar en Google" in _texto_instrucciones(v.configuracion())
 
 
 def test_busqueda_apagada_por_defecto():
     v = nueva_vision()
     assert not v.con_busqueda
     assert all(t.google_search is None for t in v.herramientas_genai())
-    assert "buscar en Google" not in v.configuracion().system_instruction
+    assert "buscar en Google" not in _texto_instrucciones(v.configuracion())
 
 
 @pytest.mark.parametrize("valor, esperado", [("true", "True"), ("false", "False"), ("", "False")])
@@ -336,7 +349,7 @@ def test_sin_busqueda():
     v = vision.VisionEnVivo(None, None, None, con_video=True, con_busqueda=False)
     tools = v.herramientas_genai()
     assert all(t.google_search is None for t in tools)
-    assert "buscar en Google" not in v.configuracion().system_instruction
+    assert "buscar en Google" not in _texto_instrucciones(v.configuracion())
 
 
 def test_sin_herramientas_tampoco_busca():
@@ -457,7 +470,7 @@ def test_tokens_se_suman_y_se_muestran_como_mucho_una_vez_por_minuto(capsys):
 
 def test_instrucciones_de_idiomas_en_todos_los_modos():
     for v in (nueva_vision(), nueva_vision(con_herramientas=False)):
-        texto = v.configuracion().system_instruction
+        texto = _texto_instrucciones(v.configuracion())
         assert "clases en otros idiomas" in texto
         assert "volvé al español" in texto
 
@@ -497,3 +510,237 @@ def test_saludo_inicial():
         asyncio.run(v.conversar())
     assert sesion.textos == ["Saludá diciendo exactamente esta frase y nada más: "
                              '"Hola Johnny, soy tu amiga ideal, soy Lucy, ¿en qué te puedo ayudar?"']
+
+
+# ---------------------------------------------------------------- reconexión
+
+VENCIDA = "BidiGenerateContent session not found or expired"
+
+
+def reconexiones(monkeypatch, cierres):
+    """Cliente cuyas conexiones fallan con los motivos dados; devuelve (visión, handles intentados)."""
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    async def sin_espera(_):
+        pass
+
+    monkeypatch.setattr(vision.asyncio, "sleep", sin_espera)
+    handles, pendientes = [], list(cierres)
+
+    class Conexion:
+        def __init__(self, config):
+            handles.append(config.session_resumption.handle)
+
+        async def __aenter__(self):
+            codigo, motivo = pendientes.pop(0) if pendientes else (1011, "corte")
+            raise ConnectionClosedError(Close(codigo, motivo), None)
+
+        async def __aexit__(self, *args):
+            return False
+
+    cliente = SimpleNamespace(aio=SimpleNamespace(live=SimpleNamespace(
+        connect=lambda model, config: Conexion(config))))
+    v = vision.VisionEnVivo(cliente, None, None, con_video=True)
+    v.conecto_alguna_vez = True  # ya veníamos conversando
+    v.saludo_hecho = True
+    v.handle = "handle-viejo"
+    return v, handles
+
+
+def test_sesion_vencida_descarta_el_handle_y_avisa(monkeypatch, capsys):
+    v, handles = reconexiones(monkeypatch, [(1008, VENCIDA)])
+    with pytest.raises(BaseException) as atrapado:
+        asyncio.run(v.conversar())
+    # Primero con el handle viejo; después del 1008, siempre con sesión nueva.
+    assert handles == ["handle-viejo", None, None, None]
+    salida = capsys.readouterr().out
+    assert salida.count("Se perdió el historial") == 1
+    assert "arrancamos de cero" in salida
+    error = vision.buscar_error(atrapado.value, vision.ErrorDeConexion)
+    assert "no pude retomarla después de 3 intentos" in str(error)
+    assert "Volvé a arrancar" in str(error)
+
+
+def test_corte_comun_reintenta_con_el_mismo_handle(monkeypatch, capsys):
+    v, handles = reconexiones(monkeypatch, [])
+    with pytest.raises(BaseException):
+        asyncio.run(v.conversar())
+    assert handles == ["handle-viejo"] * 4
+    assert "historial" not in capsys.readouterr().out
+
+
+def test_si_la_sesion_nueva_conecta_sigue_normal(monkeypatch):
+    """Tras descartar el handle, la conexión nueva entra y la charla sigue (acá se corta con Salir)."""
+    v, handles = reconexiones(monkeypatch, [(1008, VENCIDA)])
+
+    class ConexionBuena:
+        def __init__(self, config):
+            handles.append(config.session_resumption.handle)
+
+        async def __aenter__(self):
+            raise vision.Salir  # simula que conectó y el usuario escribió "salir"
+
+        async def __aexit__(self, *args):
+            return False
+
+    conexion_mala = v.cliente.aio.live.connect
+    v.cliente.aio.live.connect = lambda model, config: (
+        conexion_mala(model, config) if not handles else ConexionBuena(config))
+    with pytest.raises(BaseException) as atrapado:
+        asyncio.run(v.conversar())
+    assert vision.buscar_error(atrapado.value, vision.Salir) is not None
+    assert handles == ["handle-viejo", None]
+    assert v.handle is None and v.reintentos == 1
+
+
+def test_sin_haber_conectado_nunca_no_reintenta(monkeypatch):
+    v, handles = reconexiones(monkeypatch, [(1008, VENCIDA)])
+    v.conecto_alguna_vez = False
+    with pytest.raises(BaseException) as atrapado:
+        asyncio.run(v.conversar())
+    assert handles == ["handle-viejo"]
+    assert "Error de conexión con Gemini" in str(vision.buscar_error(atrapado.value, vision.ErrorDeConexion))
+
+
+def test_reintentos_agotados_por_cuota_lo_dice():
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    error = ConnectionClosedError(Close(1011, "You exceeded your current quota"), None)
+    assert "cuota" in vision.explicar_corte(error).lower()
+
+
+@pytest.mark.parametrize("texto, vencida", [
+    (f"1008 None. {VENCIDA}", True), ("SESSION NOT FOUND OR EXPIRED", True),
+    ("1011 internal error", False), ("1007 Unknown name", False),
+])
+def test_detecta_sesion_vencida(texto, vencida):
+    assert vision.sesion_vencida(Exception(texto)) is vencida
+
+
+def test_detecta_timeout_como_sesion_vencida():
+    assert vision.sesion_vencida(TimeoutError("websocket timed out")) is True
+
+
+def test_cambio_visual_y_compresion_jpeg():
+    from PIL import Image, ImageDraw
+
+    img1 = Image.new("RGB", (1920, 1080), color=(20, 20, 20))
+    jpeg1 = vision.comprimir_jpeg(img1)
+    reducida = Image.open(vision.io.BytesIO(jpeg1))
+    assert reducida.width == vision.ANCHO_CAPTURA
+    assert vision.hubo_cambio_visual(jpeg1, None) is True
+    assert vision.hubo_cambio_visual(jpeg1, jpeg1) is False
+
+    # Un cambio mínimo (ej. cursor titilando en un píxel) no dispara reenvío.
+    img_cursor = img1.copy()
+    img_cursor.putpixel((100, 100), (255, 255, 255))
+    assert vision.hubo_cambio_visual(img_cursor, img1) is False
+
+    # Un cambio real (ej. ventana nueva en pantalla) sí se envía.
+    img_ventana = img1.copy()
+    ImageDraw.Draw(img_ventana).rectangle([200, 200, 1400, 900], fill=(240, 240, 240))
+    assert vision.hubo_cambio_visual(img_ventana, img1) is True
+
+
+def test_encolar_video_mantiene_solo_el_ultimo_y_limpiar_sesion_vacia_todo():
+    v = nueva_vision()
+    v.handle = "h-123"
+    v.hablando = True
+    v.cola_envio.put_nowait(("audio", b"1"))
+    v.cola_parlante.put_nowait(b"voz")
+    v.encolar_video(b"frame-viejo")
+    v.encolar_video(b"frame-nuevo")
+    assert v.cola_video.qsize() == 1
+    assert v.cola_video.get_nowait() == b"frame-nuevo"
+
+    v.encolar_video(b"otro")
+    v.limpiar_sesion(descartar_handle=True)
+    assert v.handle is None
+    assert not v.hablando
+    assert v.cola_envio.empty() and v.cola_video.empty() and v.cola_parlante.empty()
+
+
+def test_procesar_encola_audio_en_cola_parlante_y_vacia_al_interrumpir():
+    v = nueva_vision()
+    parte = types.Part(inline_data=types.Blob(data=b"chunk-1", mime_type="audio/pcm"))
+    contenido = types.LiveServerContent(model_turn=types.Content(parts=[parte]))
+    assert v.procesar(contenido) is True
+    assert v.hablando is True
+    assert v.cola_parlante.get_nowait() == b"chunk-1"
+
+    v.cola_parlante.put_nowait(b"chunk-2")
+    interrupcion = types.LiveServerContent(interrupted=True)
+    assert v.procesar(interrupcion) is False
+    assert v.hablando is False
+    assert v.cola_parlante.empty()
+
+
+
+def test_regla_vision_en_tiempo_real_y_envio_hd_en_vision(monkeypatch):
+    from PIL import Image
+
+    img_hd = Image.new("RGB", (1920, 1080), color=(15, 25, 35))
+
+    class CapturaFalsa:
+        size = (1920, 1080)
+        rgb = img_hd.tobytes()
+
+    class SctFalso:
+        primary_monitor = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+        monitors = [primary_monitor, primary_monitor]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def grab(self, region):
+            return CapturaFalsa()
+
+    class MssFalso:
+        @staticmethod
+        def mss():
+            return SctFalso()
+
+    monkeypatch.setattr(herramientas, "mss", MssFalso)
+    monkeypatch.setattr(
+        herramientas, "_info_ventana_activa",
+        lambda: ("Editar conexión PostgreSQL", "dbeaver.exe", {"left": 0, "top": 0, "width": 1920, "height": 1080}),
+    )
+    monkeypatch.setattr(herramientas, "_posicion_cursor", lambda: (812, 534))
+
+    v = nueva_vision()
+    texto_prompt = _texto_instrucciones(v.configuracion())
+    assert "REGLA DE VISIÓN EN TIEMPO REAL (PROHIBIDO HABLAR A CIEGAS):" in texto_prompt
+    assert "debería aparecerte" in texto_prompt
+
+    resultado = herramientas.inspeccionar_pantalla_hd()
+    assert "Editar conexión PostgreSQL" in resultado
+    assert "Posición del cursor: (812, 534)" in resultado
+    assert not v.cola_video.empty()
+    tipo, datos = v.cola_envio.get_nowait()
+    assert tipo == "video"
+    assert vision.resolucion_jpeg(datos) == (1920, 1080)
+
+
+
+def test_drenar_en_parlante_reproduce_continuo_y_bloquea_video_mientras_suena():
+    escritos = []
+
+    class ParlanteFalso:
+        def write(self, datos: bytes):
+            escritos.append(datos)
+            # Simula que mientras la placa de sonido reproduce el primer bloque, llegan 2 chunks más
+            if len(escritos) == 1:
+                v.cola_parlante.put_nowait(b"chunk-B-")
+                v.cola_parlante.put_nowait(b"chunk-C")
+
+    v = vision.VisionEnVivo(cliente=None, microfono=None, parlante=ParlanteFalso(), con_video=True)
+    v._drenar_en_parlante(b"chunk-A-")
+
+    assert escritos == [b"chunk-A-", b"chunk-B-chunk-C"]
+    assert v.reproduciendo is False
+    assert v.audio_en_curso() is False

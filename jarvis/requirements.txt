@@ -20,3 +20,24 @@ pygame>=2.5
 google-genai>=2.33
 mss>=10.2
 pillow>=10.0
+
+# GitHub (análisis de repositorios, issues, PRs y commits)
+PyGithub>=2.3
+
+# Investigación técnica web (búsqueda y lectura de documentación)
+duckduckgo-search>=6.0
+beautifulsoup4>=4.12
+requests>=2.31
+youtube-transcript-api>=0.6.2
+
+# Ejecución remota por SSH en máquina virtual
+paramiko>=3.4
+
+# Doble Cerebro Verificador (extracción Markdown limpia, procesos/puertos, UI Windows y esquemas)
+trafilatura>=1.8
+psutil>=5.9
+pywinauto>=0.6.8
+pydantic>=2.0
+
+# Gemini web en Microsoft Edge por CDP (no necesita "playwright install": usa tu Edge)
+playwright>=1.44

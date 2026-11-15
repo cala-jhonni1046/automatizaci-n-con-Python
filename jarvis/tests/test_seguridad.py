@@ -24,6 +24,8 @@ SALTEOS = [
     "echo %GEMINI_API_KEY%",      # variables de entorno: mandarían la clave a la IA
     "echo $GEMINI_API_KEY",
     "echo ${GEMINI_API_KEY}",
+    "echo GITHUB_TOKEN",
+    "echo ghp_1234567890abcdef",
     "cat $HOME/notas.txt",
 ]
 
