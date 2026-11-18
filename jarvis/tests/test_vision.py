@@ -244,7 +244,14 @@ def test_las_lentas_son_no_bloqueantes_y_el_resto_bloqueante():
     assert comportamiento.pop("ejecutar_ssh_vm") == types.Behavior.NON_BLOCKING
     assert comportamiento.pop("inspeccionar_pantalla_hd") == types.Behavior.NON_BLOCKING
     assert comportamiento.pop("diagnosticar_y_resolver_con_certeza") == types.Behavior.NON_BLOCKING
-    for lenta in ("consultar_gemini_pro", "explicar_codigo_en_pantalla", "analizar_repositorio_con_gemini"):
+    for lenta in (
+        "consultar_gemini_pro",
+        "explicar_codigo_en_pantalla",
+        "analizar_repositorio_con_gemini",
+        "iniciar_tarea_autonoma_issue",
+        "consultar_estado_tarea_autonoma",
+        "consultar_enjambre_multicerebro",
+    ):
         assert comportamiento.pop(lenta) == types.Behavior.NON_BLOCKING
     assert set(comportamiento.values()) == {types.Behavior.BLOCKING}
 

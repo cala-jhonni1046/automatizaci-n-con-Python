@@ -42,6 +42,7 @@ PENSAMIENTO_MEDIO = "Medio"
 PENSAMIENTO_BAJO = "Bajo"
 
 _PATRON_ARGON = re.compile(r"\b(?:4\s*argon|argon\s*4|us[aá]\s+argon)\b", re.IGNORECASE)
+_PATRON_ARGON_ALTO = re.compile(r"\balt[oa]\b", re.IGNORECASE)
 _PATRON_ARGON_BAJO = re.compile(r"\bbaj[oa]\b", re.IGNORECASE)
 _PATRON_ARGON_MEDIO = re.compile(r"\bmedi[oa]\b", re.IGNORECASE)
 _PATRON_INVESTIGACION = re.compile(
@@ -55,13 +56,15 @@ _PATRON_CHAT_NUEVO = re.compile(
 )
 
 
-def _pensamiento_argon(texto: str) -> str:
-    """Devuelve 'Bajo' o 'Medio' para 4 Argon (nunca 'Alto', para ahorrar tokens)."""
+def _pensamiento_argon(texto: str, por_defecto: str = PENSAMIENTO_MEDIO) -> str:
+    """Devuelve 'Alto', 'Bajo' o 'Medio' para 4 Argon según el pedido (o por_defecto)."""
+    if _PATRON_ARGON_ALTO.search(texto or ""):
+        return PENSAMIENTO_ALTO
     if _PATRON_ARGON_BAJO.search(texto or ""):
         return PENSAMIENTO_BAJO
     if _PATRON_ARGON_MEDIO.search(texto or ""):
         return PENSAMIENTO_MEDIO
-    return PENSAMIENTO_MEDIO
+    return por_defecto
 
 
 @dataclass(frozen=True)
@@ -485,7 +488,22 @@ class ClienteGeminiWeb:
         raise ErrorGeminiWeb("Gemini no respondió a tiempo.")
 
     # -- API
-    def preguntar(self, mensaje: str, ruta: Ruta, imagen: Path | None = None) -> str:
+    def preguntar(
+        self,
+        mensaje: str,
+        ruta: Ruta | None = None,
+        imagen: Path | None = None,
+        *,
+        modelo: str | None = None,
+        pensamiento: str | None = None,
+        chat_nuevo: bool = False,
+    ) -> str:
+        if ruta is None:
+            ruta = Ruta(
+                modelo or MODELO_POR_DEFECTO,
+                pensamiento or PENSAMIENTO_ALTO,
+                chat_nuevo=chat_nuevo,
+            )
         self._conectar()
         pagina = self._pagina_principal()
         pagina.bring_to_front()

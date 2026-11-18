@@ -105,6 +105,9 @@ NO_BLOQUEANTES = {
     "consultar_gemini_pro",
     "explicar_codigo_en_pantalla",
     "analizar_repositorio_con_gemini",
+    "iniciar_tarea_autonoma_issue",
+    "consultar_estado_tarea_autonoma",
+    "consultar_enjambre_multicerebro",
 }
 
 SEGUNDOS_ENTRE_INFORMES_DE_TOKENS = 60
@@ -174,6 +177,9 @@ ACCIONES = LEY_PRECISION_ABSOLUTA + """
 - NUNCA uses investigar_a_fondo ni diagnosticar_y_resolver_con_certeza para responder preguntas teóricas o de investigación.
 - Si te piden "explicame este código", "mirá este código" o "revisá lo que tengo en pantalla", usá explicar_codigo_en_pantalla;
   para analizar un repositorio de GitHub, usá analizar_repositorio_con_gemini.
+- Cuando te pidan resolver un Issue de GitHub o una tarea de un PDF en segundo plano con Antigravity IDE y Docker, usá
+  iniciar_tarea_autonoma_issue y seguí conversando normalmente; cuando te pregunten cómo va o si ya terminó, usá consultar_estado_tarea_autonoma.
+- Cuando te pidan usar el enjambre multi-cerebro (DeepSeek + ChatGPT + Juez en Gemini 4 Argon en Alto o Medio), usá consultar_enjambre_multicerebro.
 - Antes de usar una herramienta, decí en una frase qué vas a hacer.
 - Consultar a Gemini Pro, buscar archivos y ejecutar comandos puede tardar: mientras tanto podés seguir charlando, y cuando
   llegue el resultado contalo.

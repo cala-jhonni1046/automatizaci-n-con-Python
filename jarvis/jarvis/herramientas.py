@@ -1695,3 +1695,62 @@ def analizar_repositorio_con_gemini(repositorio: str, pedido: str = "") -> str:
         f"Te paso los {len(bloques)} archivos más relevantes:\n\n" + "\n\n".join(bloques)
     )
     return _respuesta_gemini(mensaje, ruta=ruta)
+
+
+# ---------------------------------------------------------------- Orquestador Autónomo y Enjambre Multi-Cerebro
+
+from . import enjambre_web, orquestador_autonomo  # noqa: E402
+
+
+@herramienta
+def consultar_enjambre_multicerebro(
+    consulta: str,
+    contexto_pantalla: str = "",
+    modelo_juez: str = "4 Argon",
+    nivel_juez: str = "Alto",
+) -> str:
+    """Consulta al Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez Supremo en Gemini '4 Argon' en nivel 'Alto' o 'Medio').
+    consulta: el problema técnico, arquitectónico o de código a resolver.
+    contexto_pantalla: transcripción de los datos visibles en pantalla (si aplica).
+    modelo_juez: modelo Juez en Gemini web ('4 Argon' por defecto).
+    nivel_juez: nivel de pensamiento del Juez ('Alto' por defecto, o 'Medio').
+    """
+    try:
+        return enjambre_web.consultar_enjambre_multicerebro(
+            consulta=consulta,
+            contexto_pantalla=contexto_pantalla,
+            modelo_juez=modelo_juez,
+            nivel_juez=nivel_juez,
+        )
+    except Exception as e:
+        log.warning("Fallo en consultar_enjambre_multicerebro (%s); usando fallback.", e)
+        return _fallback_respuesta_estandar(consulta, str(e))
+
+
+@herramienta
+def iniciar_tarea_autonoma_issue(
+    origen_issue_o_pdf: str,
+    modelo: str = "3.1 Pro",
+    usar_enjambre: bool = False,
+    nivel_juez: str = "Alto",
+) -> str:
+    """Inicia en segundo plano la resolución autónoma de un Issue de GitHub o tarea en PDF (Docker + Antigravity IDE + Auditoría en Gemini Edge o Enjambre).
+    origen_issue_o_pdf: URL del Issue de GitHub, ruta local de un PDF/documento o descripción de la tarea.
+    modelo: modelo arquitecto/auditor en Gemini web ('3.1 Pro' por defecto o '4 Argon' si el usuario lo pide).
+    usar_enjambre: si es True, usa el Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez 4 Argon) para diseñar y auditar.
+    nivel_juez: nivel de pensamiento de 4 Argon como Juez del enjambre ('Alto' o 'Medio').
+    """
+    return orquestador_autonomo.iniciar_tarea_autonoma(
+        origen_issue_o_pdf,
+        modelo=modelo,
+        usar_enjambre=usar_enjambre,
+        nivel_juez=nivel_juez,
+    )
+
+
+@herramienta
+def consultar_estado_tarea_autonoma() -> str:
+    """Consulta en qué etapa va la tarea autónoma en segundo plano o devuelve el informe final auditado si ya terminó.
+    """
+    return orquestador_autonomo.consultar_estado_tarea()
+

@@ -390,7 +390,7 @@ def test_consultar_gemini_pro_concatena_contexto_pantalla_antes_de_consulta(monk
 
 
 def test_argon_soporta_bajo_y_medio_y_fast_path_restaura_alto_al_volver():
-    # 1) Niveles Bajo y Medio para 4 Argon
+    # 1) Niveles Bajo, Medio y Alto para 4 Argon
     r_bajo = gemini_web.elegir_modelo("Usá Argon 4 en bajo para revisar este bloque")
     assert r_bajo.modelo == "4 Argon"
     assert r_bajo.pensamiento == "Bajo"
@@ -398,6 +398,10 @@ def test_argon_soporta_bajo_y_medio_y_fast_path_restaura_alto_al_volver():
     r_medio = gemini_web.elegir_modelo("Usá Argon 4 en medio para analizar el diseño")
     assert r_medio.modelo == "4 Argon"
     assert r_medio.pensamiento == "Medio"
+
+    r_alto = gemini_web.elegir_modelo("Usá Argon 4 en alto como juez de arquitectura")
+    assert r_alto.modelo == "4 Argon"
+    assert r_alto.pensamiento == "Alto"
 
     # 2) Fast-Path y restauración de intensidad al pasar de Argon (Bajo/Medio) a Hydrogen/3.1 Pro (Alto)
     clics = []
@@ -460,6 +464,12 @@ def test_argon_soporta_bajo_y_medio_y_fast_path_restaura_alto_al_volver():
     cliente._seleccionar_modelo(pagina, r_medio)
     assert clics == ["boton:4 Argon", "opcion:4 Argon", "pensamiento:Medio", "key:Escape"]
     assert cliente._ultimo_pensamiento == "Medio"
+
+    # Si se pide 4 Argon en Alto (como Juez), cambia la intensidad a Alto dentro de 4 Argon
+    clics.clear()
+    cliente._seleccionar_modelo(pagina, r_alto)
+    assert clics == ["boton:4 Argon", "opcion:4 Argon", "pensamiento:Alto", "key:Escape"]
+    assert cliente._ultimo_pensamiento == "Alto"
 
     # Al volver a 4 Hydrogen (Alto), abre el menú y restaura explícitamente pensamiento Alto
     clics.clear()
