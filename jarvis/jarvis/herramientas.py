@@ -173,8 +173,9 @@ def ejecutar(nombre: str, argumentos: dict) -> str:
     except TypeError as e:
         return f"Error en los parámetros: {e}"
     except Exception as e:  # la IA recibe el error y puede intentar otra cosa
-        log.exception("Falló %s", nombre)
-        return f"Error al ejecutar {nombre}: {ocultar_secretos(str(e))}"
+        detalle = f"{type(e).__name__}: {e}"
+        log.exception("Falló %s (%s)", nombre, detalle)
+        return f"Error al ejecutar {nombre}: {ocultar_secretos(detalle)}"
 
 
 def _abrir_con_el_sistema(objetivo: str) -> None:
@@ -998,14 +999,35 @@ def _procesar_item_investigacion(item: dict) -> str:
 
 @herramienta
 def investigar_a_fondo(consulta: str, solo_fuentes_oficiales: bool = False) -> str:
-    """Delega la investigación profunda directamente a Gemini Pro en Microsoft Edge usando el modelo '3.1 Pro'.
+    """Delega la investigación profunda directamente a Gemini Pro en Microsoft Edge forzando nivel de pensamiento 'Alto'.
     consulta: términos técnicos o pregunta a investigar.
     solo_fuentes_oficiales: parámetro opcional mantenido por compatibilidad.
     """
     consulta_limpia = normalizar_consulta_tecnica(consulta)
     if not consulta_limpia:
         return "Indicá qué consulta técnica querés investigar."
-    return consultar_gemini_pro(consulta_limpia, modelo="3.1 Pro")
+    return consultar_gemini_pro(
+        consulta_limpia,
+        modelo=gemini_web.MODELO_INVESTIGACION,
+        pensamiento=gemini_web.PENSAMIENTO_ALTO,
+    )
+
+
+@herramienta
+def investigar_tema_profundo(consulta: str, contexto_pantalla: str = "") -> str:
+    """Ejecuta una investigación profunda en Gemini Pro (Edge) forzando nivel de pensamiento 'Alto'.
+    consulta: pregunta o tema técnico a investigar a fondo.
+    contexto_pantalla: transcripción opcional de los datos visibles en pantalla.
+    """
+    consulta_limpia = normalizar_consulta_tecnica(consulta)
+    if not consulta_limpia:
+        return "Indicá qué tema o consulta técnica querés investigar a fondo."
+    return consultar_gemini_pro(
+        consulta_limpia,
+        modelo=gemini_web.MODELO_INVESTIGACION,
+        contexto_pantalla=contexto_pantalla,
+        pensamiento=gemini_web.PENSAMIENTO_ALTO,
+    )
 
 
 # ---------------------------------------------------------------- YouTube (transcripciones)
@@ -1522,20 +1544,67 @@ PROMPT_EXPLICAR_CODIGO = (
 )
 
 
-def _fallback_respuesta_estandar(mensaje: str, motivo: str) -> str:
-    """Si Gemini web se bloquea o lanza excepción, responde con el modelo estándar de Jarvis por API."""
+MODELOS_ROTACION_FALLBACK = (
+    "gemini/gemini-flash-latest",
+    "gemini/gemini-2.5-flash",
+    "gemini/gemini-flash-lite-latest",
+)
+TIMEOUT_ENJAMBRE_SEGUNDOS = 180.0
+
+
+def _es_modelo_gemini_sin_temperatura(modelo: str) -> bool:
+    """True en modelos Gemini 3+ / *-latest donde temperature/top_p/top_k emiten DeprecationWarning."""
+    m = (modelo or "").strip().lower()
+    return "gemini-flash-latest" in m or "gemini-pro-latest" in m or "gemini-3" in m
+
+
+def _fallback_respuesta_estandar(
+    mensaje: str,
+    motivo: str,
+    permitir_puente_edge: bool = True,
+) -> str:
+    """Rota entre modelos Gemini de respaldo ante 503/RateLimit/timeout y, si todos caen, intenta 4 Hydrogen en Edge."""
     if litellm is not None and config.clave_configurada():
+        candidatos: list[str] = []
+        for m in (config.MODELO, *MODELOS_ROTACION_FALLBACK):
+            if m and m not in candidatos:
+                candidatos.append(m)
+
+        for modelo_actual in candidatos:
+            try:
+                kwargs: dict = {
+                    "model": modelo_actual,
+                    "messages": [{"role": "user", "content": mensaje}],
+                }
+                if not _es_modelo_gemini_sin_temperatura(modelo_actual):
+                    kwargs["temperature"] = 0.1
+                respuesta = litellm.completion(**kwargs)
+                texto = (respuesta.choices[0].message.content or "").strip()
+                if texto:
+                    return ocultar_secretos(f"[Fallback estándar Jarvis ({modelo_actual})]\n{texto}")
+            except Exception as e:
+                log.warning(
+                    "Modelo de fallback %s falló (%s: %s); rotando al siguiente.",
+                    modelo_actual,
+                    type(e).__name__,
+                    e,
+                )
+
+    if permitir_puente_edge:
         try:
-            respuesta = litellm.completion(
-                model=config.MODELO,
-                messages=[{"role": "user", "content": mensaje}],
-                temperature=0.1,
+            ruta_h = gemini_web.Ruta(
+                gemini_web.MODELO_POR_DEFECTO,
+                gemini_web.PENSAMIENTO_POR_DEFECTO,
+                chat_nuevo=False,
             )
-            texto = (respuesta.choices[0].message.content or "").strip()
-            if texto:
-                return ocultar_secretos(f"[Fallback estándar Jarvis ({config.MODELO})]\n{texto}")
+            texto_edge = gemini_web.consultar(mensaje, ruta=ruta_h)
+            if texto_edge:
+                return ocultar_secretos(
+                    f"[Fallback Edge {gemini_web.MODELO_POR_DEFECTO} · pensamiento {gemini_web.PENSAMIENTO_POR_DEFECTO}]\n{texto_edge}"
+                )
         except Exception as e:
-            log.warning("Fallback estándar también falló: %s", e)
+            log.warning("Respaldo final en Edge %s también falló (%s: %s)", gemini_web.MODELO_POR_DEFECTO, type(e).__name__, e)
+
     return f"No pude usar Gemini web: {ocultar_secretos(motivo)}"
 
 
@@ -1545,11 +1614,13 @@ def _respuesta_gemini(mensaje: str, ruta: "gemini_web.Ruta | None" = None, image
     try:
         respuesta = gemini_web.consultar(mensaje, ruta=ruta, imagen=imagen)
     except gemini_web.ErrorGeminiWeb as e:
-        log.warning("Gemini web falló (%s); ejecutando fallback estándar.", e)
-        return _fallback_respuesta_estandar(mensaje, str(e))
+        detalle = f"{type(e).__name__}: {e}"
+        log.warning("Gemini web falló (%s); ejecutando fallback estándar.", detalle)
+        return _fallback_respuesta_estandar(mensaje, str(e), permitir_puente_edge=False)
     except Exception as e:
-        log.warning("Excepción en Gemini web (%s); ejecutando fallback estándar.", e)
-        return _fallback_respuesta_estandar(mensaje, f"{type(e).__name__}: {e}")
+        detalle = f"{type(e).__name__}: {e}"
+        log.warning("Excepción en Gemini web (%s); ejecutando fallback estándar.", detalle)
+        return _fallback_respuesta_estandar(mensaje, detalle, permitir_puente_edge=False)
     return ocultar_secretos(f"[Gemini {ruta.modelo} · pensamiento {ruta.pensamiento}]\n{respuesta}")
 
 
@@ -1583,29 +1654,51 @@ def _capturar_pantalla_png() -> Path:
     return ruta
 
 
-def _resolver_ruta_gemini(consulta: str, modelo: str = "4 Hydrogen") -> "gemini_web.Ruta":
-    """Resuelve la Ruta de Gemini web respetando el parámetro modelo explícito o las reglas de la consulta."""
+def _resolver_ruta_gemini(
+    consulta: str,
+    modelo: str = gemini_web.MODELO_POR_DEFECTO,
+    pensamiento: str | None = None,
+) -> "gemini_web.Ruta":
+    """Resuelve la Ruta de Gemini web respetando el parámetro modelo/pensamiento explícito o las reglas de la consulta."""
     modelo_limpio = (modelo or "").strip().lower()
     chat_nuevo = bool(gemini_web._PATRON_CHAT_NUEVO.search(consulta or ""))
-    if "argon" in modelo_limpio or gemini_web._PATRON_ARGON.search(consulta or ""):
-        pensamiento = gemini_web._pensamiento_argon(f"{modelo or ''} {consulta or ''}")
-        return gemini_web.Ruta(gemini_web.MODELO_ARGON, pensamiento, chat_nuevo=chat_nuevo)
-    if "3.1" in modelo_limpio or "pro" in modelo_limpio:
-        return gemini_web.Ruta(gemini_web.MODELO_INVESTIGACION, gemini_web.PENSAMIENTO_ALTO, chat_nuevo=chat_nuevo)
+    es_investigacion = bool(gemini_web._PATRON_INVESTIGACION.search(consulta or "")) or "3.1" in modelo_limpio or "pro" in modelo_limpio
+    if pensamiento:
+        nivel = pensamiento.strip()
+        modelo_resuelto = (
+            gemini_web.MODELO_INVESTIGACION
+            if ("3.1" in modelo_limpio or "pro" in modelo_limpio) and modelo_limpio != gemini_web.MODELO_POR_DEFECTO.lower()
+            else gemini_web.normalizar_nombre_modelo(modelo)
+        )
+        return gemini_web.Ruta(modelo_resuelto, nivel, chat_nuevo=chat_nuevo)
+    if es_investigacion:
+        modelo_inv = "3.1 Pro" if ("3.1" in modelo_limpio or "pro" in modelo_limpio) else gemini_web.MODELO_INVESTIGACION
+        return gemini_web.Ruta(modelo_inv, gemini_web.PENSAMIENTO_ALTO, chat_nuevo=chat_nuevo)
+    if any(k in modelo_limpio for k in ("argon", "neo")) or gemini_web._PATRON_NEO.search(consulta or ""):
+        nivel_neo = gemini_web._pensamiento_neo(f"{modelo or ''} {consulta or ''}", por_defecto=gemini_web.PENSAMIENTO_POR_DEFECTO)
+        return gemini_web.Ruta(gemini_web.MODELO_NEO, nivel_neo, chat_nuevo=chat_nuevo)
+    if modelo_limpio and modelo_limpio != gemini_web.MODELO_POR_DEFECTO.lower():
+        return gemini_web.Ruta(gemini_web.normalizar_nombre_modelo(modelo), gemini_web.PENSAMIENTO_POR_DEFECTO, chat_nuevo=chat_nuevo)
     return gemini_web.elegir_modelo(consulta)
 
 
 @herramienta
-def consultar_gemini_pro(consulta: str, modelo: str = "4 Hydrogen", contexto_pantalla: str = "") -> str:
-    """Razona y responde con tu cuenta de Gemini Pro en Edge ('4 Hydrogen' Alto por defecto; '3.1 Pro' Alto para investigación profunda; '4 Argon' Medio solo si se pide explícitamente).
+def consultar_gemini_pro(
+    consulta: str,
+    modelo: str = gemini_web.MODELO_POR_DEFECTO,
+    contexto_pantalla: str = "",
+    pensamiento: str = "",
+) -> str:
+    """Razona y responde con tu cuenta de Gemini Pro en Edge ('Neo' en 'Medio' por defecto; nivel 'Alto' para investigación profunda).
     consulta: la pregunta o tarea completa tal como la pidió el usuario.
-    modelo: modelo a usar en Gemini web ('4 Hydrogen' por defecto, '3.1 Pro' para investigación profunda, o '4 Argon' solo si el usuario lo nombra).
+    modelo: modelo a usar en Gemini web ('Neo' por defecto).
     contexto_pantalla: transcripción completa y exacta de todo lo que se ve actualmente en la pantalla del usuario (nombre del programa, código, comandos de terminal, tablas o mensajes de error).
+    pensamiento: nivel de pensamiento opcional ('Medio' por defecto, 'Alto' para investigación profunda o 'Bajo').
     """
     consulta = (consulta or "").strip()
     if not consulta:
         return "Indicá qué querés consultarle a Gemini."
-    ruta = _resolver_ruta_gemini(consulta, modelo=modelo)
+    ruta = _resolver_ruta_gemini(consulta, modelo=modelo, pensamiento=pensamiento or None)
     contexto = (contexto_pantalla or "").strip()
     mensaje_final = (
         f"CONTEXTO VISIBLE EN LA PANTALLA DEL USUARIO:\n{contexto}\n\nCONSULTA DEL USUARIO:\n{consulta}"
@@ -1699,46 +1792,130 @@ def analizar_repositorio_con_gemini(repositorio: str, pedido: str = "") -> str:
 
 # ---------------------------------------------------------------- Orquestador Autónomo y Enjambre Multi-Cerebro
 
+import threading as _threading  # noqa: E402
 from . import enjambre_web, orquestador_autonomo  # noqa: E402
+
+_ESTADO_ENJAMBRE = enjambre_web._ESTADO_ENJAMBRE
+
+MENSAJE_ENJAMBRE_SEGUNDO_PLANO = (
+    "Enjambre iniciado en segundo plano (DeepSeek + ChatGPT + Juez Neo). "
+    "El usuario puede seguir conversando normalmente de otros temas y consultar el veredicto en unos segundos."
+)
+
+_PATRON_CONSULTA_VEREDICTO_ENJAMBRE = re.compile(
+    r"\b(?:termin[oó]|listo|veredicto|respondi[oó]|resultado|c[oó]mo\s+va|qu[eé]\s+dijo|estado)\b.*\benjambre\b|"
+    r"\benjambre\b.*\b(?:termin[oó]|listo|veredicto|respondi[oó]|resultado|c[oó]mo\s+va|qu[eé]\s+dijo|estado)\b|"
+    r"^(?:veredicto|estado\s+del\s+enjambre|resultado\s+del\s+enjambre)$",
+    re.IGNORECASE,
+)
+
+
+def _ejecutar_enjambre_con_respaldo(
+    consulta: str,
+    contexto_pantalla: str = "",
+    modelo_juez: str = gemini_web.MODELO_NEO,
+    nivel_juez: str = gemini_web.PENSAMIENTO_MEDIO,
+) -> str:
+    """Ejecuta el enjambre completo y, ante fallo extremo, aplica la rotación de fallback."""
+    try:
+        return enjambre_web.consultar_enjambre_multicerebro(
+            consulta=consulta,
+            contexto_pantalla=contexto_pantalla,
+            modelo_juez=gemini_web.normalizar_nombre_modelo(modelo_juez),
+            nivel_juez=nivel_juez,
+            timeout=TIMEOUT_ENJAMBRE_SEGUNDOS,
+        )
+    except Exception as e:
+        detalle = f"{type(e).__name__}: {e}"
+        log.warning("Fallo en consultar_enjambre_multicerebro (%s); usando fallback.", detalle)
+        return _fallback_respuesta_estandar(consulta, detalle, permitir_puente_edge=True)
+
+
+def _correr_enjambre_en_segundo_plano(
+    consulta: str,
+    contexto_pantalla: str,
+    modelo_juez: str,
+    nivel_juez: str,
+) -> None:
+    try:
+        resultado = _ejecutar_enjambre_con_respaldo(
+            consulta=consulta,
+            contexto_pantalla=contexto_pantalla,
+            modelo_juez=modelo_juez,
+            nivel_juez=nivel_juez,
+        )
+        _ESTADO_ENJAMBRE["resultado"] = resultado
+        _ESTADO_ENJAMBRE["etapa"] = "Completado"
+        _ESTADO_ENJAMBRE["estado"] = "completado"
+    except Exception as e:
+        detalle = f"{type(e).__name__}: {e}"
+        _ESTADO_ENJAMBRE["resultado"] = f"Error en el enjambre ({detalle})"
+        _ESTADO_ENJAMBRE["etapa"] = "Error"
+        _ESTADO_ENJAMBRE["estado"] = "error"
 
 
 @herramienta
 def consultar_enjambre_multicerebro(
     consulta: str,
     contexto_pantalla: str = "",
-    modelo_juez: str = "4 Argon",
-    nivel_juez: str = "Alto",
+    modelo_juez: str = gemini_web.MODELO_NEO,
+    nivel_juez: str = gemini_web.PENSAMIENTO_MEDIO,
 ) -> str:
-    """Consulta al Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez Supremo en Gemini '4 Argon' en nivel 'Alto' o 'Medio').
-    consulta: el problema técnico, arquitectónico o de código a resolver.
+    """Inicia en segundo plano el Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez 'Neo' en 'Medio') o devuelve el veredicto si ya terminó.
+    consulta: el problema técnico, arquitectónico o de código a resolver (o pregunta de si ya terminó el enjambre).
     contexto_pantalla: transcripción de los datos visibles en pantalla (si aplica).
-    modelo_juez: modelo Juez en Gemini web ('4 Argon' por defecto).
-    nivel_juez: nivel de pensamiento del Juez ('Alto' por defecto, o 'Medio').
+    modelo_juez: modelo Juez en Gemini web ('Neo' por defecto).
+    nivel_juez: nivel de pensamiento del Juez ('Medio' por defecto, o 'Alto').
     """
-    try:
-        return enjambre_web.consultar_enjambre_multicerebro(
-            consulta=consulta,
-            contexto_pantalla=contexto_pantalla,
-            modelo_juez=modelo_juez,
-            nivel_juez=nivel_juez,
+    consulta_limpia = (consulta or "").strip()
+    if not consulta_limpia:
+        return "Indicá la consulta o problema técnico para someter al Enjambre Multi-Cerebro."
+
+    pide_veredicto = bool(_PATRON_CONSULTA_VEREDICTO_ENJAMBRE.search(consulta_limpia))
+    misma_consulta_terminada = (
+        _ESTADO_ENJAMBRE.get("estado") == "completado"
+        and bool(_ESTADO_ENJAMBRE.get("resultado"))
+        and consulta_limpia.lower() == (_ESTADO_ENJAMBRE.get("consulta") or "").strip().lower()
+    )
+
+    if (pide_veredicto or misma_consulta_terminada) and _ESTADO_ENJAMBRE.get("resultado"):
+        return str(_ESTADO_ENJAMBRE["resultado"])
+
+    if pide_veredicto and _ESTADO_ENJAMBRE.get("estado") == "en_progreso":
+        return (
+            f"El Enjambre Multi-Cerebro sigue deliberando ({_ESTADO_ENJAMBRE.get('etapa')}). "
+            "Seguí conversando tranquilo y consultame el veredicto en unos segundos."
         )
-    except Exception as e:
-        log.warning("Fallo en consultar_enjambre_multicerebro (%s); usando fallback.", e)
-        return _fallback_respuesta_estandar(consulta, str(e))
+
+    modelo_juez_norm = gemini_web.normalizar_nombre_modelo(modelo_juez)
+    _ESTADO_ENJAMBRE.update({
+        "estado": "en_progreso",
+        "consulta": consulta_limpia,
+        "etapa": f"Deliberando en paralelo (DeepSeek + ChatGPT + Juez {modelo_juez_norm})",
+        "resultado": "",
+    })
+    hilo = _threading.Thread(
+        target=_correr_enjambre_en_segundo_plano,
+        args=(consulta_limpia, contexto_pantalla, modelo_juez_norm, nivel_juez),
+        name="jarvis-enjambre-bg",
+        daemon=True,
+    )
+    hilo.start()
+    return MENSAJE_ENJAMBRE_SEGUNDO_PLANO
 
 
 @herramienta
 def iniciar_tarea_autonoma_issue(
     origen_issue_o_pdf: str,
-    modelo: str = "3.1 Pro",
+    modelo: str = gemini_web.MODELO_NEO,
     usar_enjambre: bool = False,
-    nivel_juez: str = "Alto",
+    nivel_juez: str = gemini_web.PENSAMIENTO_MEDIO,
 ) -> str:
     """Inicia en segundo plano la resolución autónoma de un Issue de GitHub o tarea en PDF (Docker + Antigravity IDE + Auditoría en Gemini Edge o Enjambre).
     origen_issue_o_pdf: URL del Issue de GitHub, ruta local de un PDF/documento o descripción de la tarea.
-    modelo: modelo arquitecto/auditor en Gemini web ('3.1 Pro' por defecto o '4 Argon' si el usuario lo pide).
-    usar_enjambre: si es True, usa el Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez 4 Argon) para diseñar y auditar.
-    nivel_juez: nivel de pensamiento de 4 Argon como Juez del enjambre ('Alto' o 'Medio').
+    modelo: modelo arquitecto/auditor en Gemini web ('Neo' por defecto).
+    usar_enjambre: si es True, usa el Enjambre Multi-Cerebro (DeepSeek + ChatGPT + Juez Neo) para diseñar y auditar.
+    nivel_juez: nivel de pensamiento de Neo como Juez del enjambre ('Medio' por defecto o 'Alto').
     """
     return orquestador_autonomo.iniciar_tarea_autonoma(
         origen_issue_o_pdf,

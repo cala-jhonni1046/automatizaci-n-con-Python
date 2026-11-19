@@ -151,13 +151,13 @@ def test_ciclo_autonomo_completo_arquitecto_ejecutor_auditor(monkeypatch, tmp_pa
     )
 
     assert len(consultas_gemini) == 2
-    # Arquitecto y Auditor usan el mismo chat (chat_nuevo=False) y respetan 4 Argon en Medio
+    # Arquitecto y Auditor usan el mismo chat (chat_nuevo=False) y resuelven alias 4 Argon -> Neo en Medio
     _, ruta_arq = consultas_gemini[0]
     msg_aud, ruta_aud = consultas_gemini[1]
-    assert ruta_arq.modelo == "4 Argon"
+    assert ruta_arq.modelo == "Neo"
     assert ruta_arq.pensamiento == "Medio"
     assert ruta_arq.chat_nuevo is False
-    assert ruta_aud.modelo == "4 Argon"
+    assert ruta_aud.modelo == "Neo"
     assert ruta_aud.pensamiento == "Medio"
     assert ruta_aud.chat_nuevo is False
     assert "+def validar(): pass" in msg_aud
@@ -186,10 +186,10 @@ def test_iniciar_tarea_autonoma_issue_retorna_inmediato_y_es_no_bloqueante(monke
 
     msg = herramientas.iniciar_tarea_autonoma_issue(
         "https://github.com/org/proyecto/issues/12",
-        modelo="3.1 Pro",
+        modelo="Neo",
     )
     assert "segundo plano" in msg
-    assert hilos_iniciados == [(("https://github.com/org/proyecto/issues/12", "3.1 Pro", False, "Alto"), True)]
+    assert hilos_iniciados == [(("https://github.com/org/proyecto/issues/12", "Neo", False, "Medio"), True)]
 
     estado_en_curso = herramientas.consultar_estado_tarea_autonoma()
     assert "en progreso" in estado_en_curso

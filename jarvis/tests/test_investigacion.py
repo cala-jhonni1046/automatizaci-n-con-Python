@@ -63,24 +63,9 @@ path = /var/lib/trytond</code></pre>
       </body>
     </html>
     """
-    llamadas = []
-    _mock_entorno_web(
-        monkeypatch,
-        resultados_ddgs=[{"title": "Tryton Configuration", "href": url_doc}],
-        paginas_html={url_doc: html_complejo},
-        llamadas_get=llamadas,
-    )
+    resultado = herramientas._extraer_contenido_estructurado_html(html_complejo)
 
-    resultado = herramientas.investigar_a_fondo("configurar trytond postgresql")
-
-    # Verifica llamada HTTP con timeout=4 y User-Agent
-    assert len(llamadas) == 1
-    assert llamadas[0]["url"] == url_doc
-    assert llamadas[0]["timeout"] == 4
-    assert "Mozilla/5.0" in llamadas[0]["headers"]["User-Agent"]
-
-    # Verifica URL fuente y estructura extraída
-    assert url_doc in resultado
+    # Verifica estructura extraída y prioridad de código
     assert "# Configuración de Trytond" in resultado
     assert "## Conexión a PostgreSQL" in resultado
     assert "### Comando de inicialización" in resultado
@@ -95,71 +80,48 @@ path = /var/lib/trytond</code></pre>
     assert "Links de barra lateral" not in resultado
     assert "Copyright pie de página ruidoso" not in resultado
 
+    # Verifica que investigar_a_fondo delega a Gemini Neo en nivel Alto
+    llamadas_gemini = []
+    monkeypatch.setattr(
+        herramientas.gemini_web,
+        "consultar",
+        lambda msg, ruta=None, imagen=None, timeout=0: llamadas_gemini.append((msg, ruta)) or f"Fuente: {url_doc}",
+    )
+    out = herramientas.investigar_a_fondo("configurar trytond postgresql")
+    assert "[Gemini Neo · pensamiento Alto]" in out
+    assert llamadas_gemini[0][1].modelo == "Neo"
+    assert llamadas_gemini[0][1].pensamiento == "Alto"
+
 
 # ---------------------------------------------------------------- límite de 12.000 caracteres y prioridad <pre><code>
 
 def test_investigar_a_fondo_respeta_limite_12000_caracteres_y_prioriza_codigo(monkeypatch):
-    resultados = [
-        {"title": f"Doc {i}", "href": f"https://postgresql.org/docs/parte-{i}"}
-        for i in range(4)
-    ]
     prosa_larga = "<p>" + ("Texto introductorio extenso sobre arquitectura. " * 350) + "</p>"
     codigo_critico = "<pre><code>ALTER SYSTEM SET shared_buffers = '4GB';</code></pre>"
-    paginas = {
-        r["href"]: f"<html><body><h1>Título {i}</h1>{prosa_larga}{codigo_critico}</body></html>"
-        for i, r in enumerate(resultados)
-    }
-    _mock_entorno_web(monkeypatch, resultados, paginas)
+    html = f"<html><body><h1>Título</h1>{prosa_larga}{codigo_critico}</body></html>"
 
-    resultado = herramientas.investigar_a_fondo("postgresql tuning")
+    resultado = herramientas._extraer_contenido_estructurado_html(html)
     assert herramientas.MAX_CARACTERES_INVESTIGACION == 12_000
-    assert len(resultado) == 12_000
-    assert "ALTER SYSTEM SET shared_buffers = '4GB';" in resultado
+    assert resultado.startswith("```\nALTER SYSTEM SET shared_buffers = '4GB';\n```")
 
 
 # ---------------------------------------------------------------- priorización de fuentes oficiales
 
 def test_investigar_a_fondo_prioriza_fuentes_oficiales(monkeypatch):
-    resultados = [
-        {"title": "Blog personal", "href": "https://miblog-random.com/post-1"},
-        {"title": "Foro comercial", "href": "https://respuestas-rapidas.net/hilo"},
-        {"title": "GNU Health Wiki", "href": "https://wiki.gnuhealth.org/index.php/Installation"},
-        {"title": "PostgreSQL Official", "href": "https://www.postgresql.org/docs/current/auth.html"},
-        {"title": "Tryton Official", "href": "https://docs.tryton.org/en/latest/"},
-        {"title": "GitHub Repo", "href": "https://github.com/tryton/trytond"},
-    ]
-    paginas = {
-        r["href"]: f"<html><body><p>Contenido de {r['href']}</p></body></html>"
-        for r in resultados
-    }
-    llamadas = []
-    _mock_entorno_web(monkeypatch, resultados, paginas, llamadas_get=llamadas)
-
-    resultado = herramientas.investigar_a_fondo("instalar gnuhealth", solo_fuentes_oficiales=True)
-
-    urls_consultadas = [c["url"] for c in llamadas]
-    assert len(urls_consultadas) == 4
-    assert "https://wiki.gnuhealth.org/index.php/Installation" in urls_consultadas
-    assert "https://www.postgresql.org/docs/current/auth.html" in urls_consultadas
-    assert "https://docs.tryton.org/en/latest/" in urls_consultadas
-    assert "https://github.com/tryton/trytond" in urls_consultadas
-    assert "https://miblog-random.com/post-1" not in urls_consultadas
-    assert "https://wiki.gnuhealth.org/index.php/Installation" in resultado
+    assert herramientas._es_fuente_oficial("https://wiki.gnuhealth.org/index.php/Installation") is True
+    assert herramientas._es_fuente_oficial("https://www.postgresql.org/docs/current/auth.html") is True
+    assert herramientas._es_fuente_oficial("https://docs.tryton.org/en/latest/") is True
+    assert herramientas._es_fuente_oficial("https://github.com/tryton/trytond") is True
+    assert herramientas._es_fuente_oficial("https://miblog-random.com/post-1") is False
 
 
 # ---------------------------------------------------------------- ocultamiento de secretos
 
 def test_investigar_a_fondo_oculta_secretos(monkeypatch):
-    url = "https://github.com/org/repo/blob/main/README.md"
-    html = """
-    <html><body>
-      <pre><code>export GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwx</code></pre>
-    </body></html>
-    """
-    _mock_entorno_web(
-        monkeypatch,
-        resultados_ddgs=[{"title": "Repo", "href": url}],
-        paginas_html={url: html},
+    monkeypatch.setattr(
+        herramientas.gemini_web,
+        "consultar",
+        lambda msg, ruta=None, imagen=None, timeout=0: "export GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwx",
     )
 
     resultado = herramientas.investigar_a_fondo("token config")
@@ -234,11 +196,7 @@ def test_investigar_a_fondo_incluye_transcripcion_de_youtube(monkeypatch):
     llamadas_get, llamadas_yt = [], []
     _mock_entorno_web(
         monkeypatch,
-        resultados_ddgs=[
-            {"title": "pg_hba.conf", "href": url_doc},
-            {"title": "Tutorial PostgreSQL", "href": url_yt},
-            {"title": "Short PostgreSQL", "href": url_yt_corto},
-        ],
+        resultados_ddgs=[],
         paginas_html={url_doc: "<html><body><pre><code>host all all 0.0.0.0/0 md5</code></pre></body></html>"},
         llamadas_get=llamadas_get,
     )
@@ -247,7 +205,12 @@ def test_investigar_a_fondo_incluye_transcripcion_de_youtube(monkeypatch):
         "XYZxyz98765": [{"text": "Reiniciá el servicio", "start": 0.0}],
     }, llamadas=llamadas_yt)
 
-    resultado = herramientas.investigar_a_fondo("configurar pg_hba postgresql")
+    partes = [
+        herramientas._procesar_item_investigacion({"title": "pg_hba.conf", "href": url_doc}),
+        herramientas._procesar_item_investigacion({"title": "Tutorial PostgreSQL", "href": url_yt}),
+        herramientas._procesar_item_investigacion({"title": "Short PostgreSQL", "href": url_yt_corto}),
+    ]
+    resultado = "\n\n".join(p for p in partes if p)
 
     # Los videos no se descargan como HTML: solo la página de documentación.
     assert [c["url"] for c in llamadas_get] == [url_doc]
@@ -266,14 +229,15 @@ def test_investigar_a_fondo_ignora_video_sin_transcripcion(monkeypatch):
     url_yt = "https://youtu.be/sinSubs0001"
     _mock_entorno_web(
         monkeypatch,
-        resultados_ddgs=[{"title": "Video", "href": url_yt}, {"title": "Wiki", "href": url_doc}],
+        resultados_ddgs=[],
         paginas_html={url_doc: "<html><body><p>Instalá con pip install gnuhealth</p></body></html>"},
     )
     _mock_youtube(monkeypatch, {"sinSubs0001": RuntimeError("NoTranscriptFound")})
 
-    resultado = herramientas.investigar_a_fondo("instalar gnuhealth")
-    assert "Instalá con pip install gnuhealth" in resultado
-    assert url_yt not in resultado
+    out_yt = herramientas._procesar_item_investigacion({"title": "Video", "href": url_yt})
+    out_doc = herramientas._procesar_item_investigacion({"title": "Wiki", "href": url_doc})
+    assert out_yt == ""
+    assert "Instalá con pip install gnuhealth" in out_doc
 
 
 def test_leer_video_youtube_con_url_directa(monkeypatch):
@@ -383,14 +347,13 @@ def test_normalizar_consulta_tecnica(entrada, esperado):
 def test_investigar_a_fondo_aplica_corrector_fonetico(monkeypatch):
     consultas_vistas = []
 
-    class DDGSFalso:
-        def text(self, consulta, max_results=4):
-            consultas_vistas.append(consulta)
-            return []
-
-    monkeypatch.setattr(herramientas, "DDGS", DDGSFalso)
+    monkeypatch.setattr(
+        herramientas.gemini_web,
+        "consultar",
+        lambda msg, ruta=None, imagen=None, timeout=0: consultas_vistas.append((msg, ruta.modelo, ruta.pensamiento)) or "OK",
+    )
     herramientas.investigar_a_fondo("conectar divi builder con genugel y triton en posgre")
-    assert consultas_vistas == ["conectar DBeaver con GNU Health y Tryton en PostgreSQL"]
+    assert consultas_vistas == [("conectar DBeaver con GNU Health y Tryton en PostgreSQL", "Neo", "Alto")]
 
 
 # ---------------------------------------------------------------- temperatura 0.1 y Ley de Precisión Absoluta

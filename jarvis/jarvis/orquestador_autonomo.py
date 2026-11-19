@@ -2,7 +2,7 @@
 
 Resuelve Issues de GitHub o especificaciones en PDF conectando:
 1. Búsqueda del repositorio local (.git/config) y levantado de base de datos / Docker.
-2. Arquitecto en Gemini Web (Microsoft Edge con 3.1 Pro Alto o 4 Argon Medio/Bajo).
+2. Arquitecto en Gemini Web (Microsoft Edge con Neo en Medio o Alto).
 3. Ejecutor en Antigravity IDE (copia y envío del prompt técnico + monitoreo de git status / git diff).
 4. Auditor en el mismo chat de Gemini Web (chat_nuevo=False) validando el git diff y generando el
    informe final estructurado en _ESTADO_TAREA_AUTONOMA.
@@ -405,23 +405,24 @@ def _monitorear_cambios_git(
 
 def _ruta_modelo_orquestador(modelo: str) -> gemini_web.Ruta:
     """Construye la Ruta de Gemini Web manteniendo siempre el mismo chat activo (chat_nuevo=False)."""
-    texto = (modelo or "3.1 Pro").strip()
-    if "argon" in texto.lower():
+    texto = (modelo or gemini_web.MODELO_POR_DEFECTO).strip()
+    minuscula = texto.lower()
+    if any(k in minuscula for k in ("argon", "neo")):
         return gemini_web.Ruta(
-            gemini_web.MODELO_ARGON,
-            gemini_web._pensamiento_argon(texto),
+            gemini_web.MODELO_NEO,
+            gemini_web._pensamiento_neo(texto),
             chat_nuevo=False,
         )
-    if "3.1" in texto.lower() or "pro" in texto.lower():
-        return gemini_web.Ruta(gemini_web.MODELO_INVESTIGACION, gemini_web.PENSAMIENTO_ALTO, chat_nuevo=False)
-    return gemini_web.Ruta(gemini_web.MODELO_POR_DEFECTO, gemini_web.PENSAMIENTO_ALTO, chat_nuevo=False)
+    if "3.1" in minuscula or "pro" in minuscula:
+        return gemini_web.Ruta("3.1 Pro", gemini_web.PENSAMIENTO_ALTO, chat_nuevo=False)
+    return gemini_web.Ruta(gemini_web.MODELO_POR_DEFECTO, gemini_web.PENSAMIENTO_POR_DEFECTO, chat_nuevo=False)
 
 
 def _ejecutar_ciclo_autonomo(
     origen_issue_o_pdf: str,
-    modelo: str = "3.1 Pro",
+    modelo: str = gemini_web.MODELO_NEO,
     usar_enjambre: bool = False,
-    nivel_juez: str = "Alto",
+    nivel_juez: str = gemini_web.PENSAMIENTO_MEDIO,
 ) -> None:
     """Ejecuta en segundo plano el ciclo completo: Arquitecto -> Ejecutor -> Auditor."""
     from . import enjambre_web
@@ -429,7 +430,7 @@ def _ejecutar_ciclo_autonomo(
     try:
         _ESTADO_TAREA_AUTONOMA["estado"] = "en_progreso"
         _ESTADO_TAREA_AUTONOMA["origen"] = origen_issue_o_pdf
-        _ESTADO_TAREA_AUTONOMA["modelo"] = f"Enjambre 4 Argon ({nivel_juez})" if usar_enjambre else modelo
+        _ESTADO_TAREA_AUTONOMA["modelo"] = f"Enjambre Neo ({nivel_juez})" if usar_enjambre else gemini_web.normalizar_nombre_modelo(modelo)
         _ESTADO_TAREA_AUTONOMA["resumen_final"] = ""
 
         # a) Extraer detalle del Issue/PDF y localizar el repositorio local
@@ -453,11 +454,11 @@ def _ejecutar_ciclo_autonomo(
         )
         if usar_enjambre:
             _ESTADO_TAREA_AUTONOMA["etapa_actual"] = (
-                f"Consultando al Enjambre Multi-Cerebro (Juez 4 Argon · {nivel_juez}) como Arquitecto"
+                f"Consultando al Enjambre Multi-Cerebro (Juez Neo · {nivel_juez}) como Arquitecto"
             )
             prompt_agente = enjambre_web.consultar_enjambre_multicerebro(
                 prompt_arquitecto,
-                modelo_juez=gemini_web.MODELO_ARGON,
+                modelo_juez=gemini_web.MODELO_NEO,
                 nivel_juez=nivel_juez,
             )
         else:
@@ -496,11 +497,11 @@ def _ejecutar_ciclo_autonomo(
         )
         if usar_enjambre:
             _ESTADO_TAREA_AUTONOMA["etapa_actual"] = (
-                f"Auditando git diff con el Enjambre Multi-Cerebro (Juez 4 Argon · {nivel_juez})"
+                f"Auditando git diff con el Enjambre Multi-Cerebro (Juez Neo · {nivel_juez})"
             )
             informe_final = enjambre_web.consultar_enjambre_multicerebro(
                 prompt_auditor,
-                modelo_juez=gemini_web.MODELO_ARGON,
+                modelo_juez=gemini_web.MODELO_NEO,
                 nivel_juez=nivel_juez,
             )
         else:
@@ -524,9 +525,9 @@ def _ejecutar_ciclo_autonomo(
 
 def iniciar_tarea_autonoma(
     origen_issue_o_pdf: str,
-    modelo: str = "3.1 Pro",
+    modelo: str = gemini_web.MODELO_NEO,
     usar_enjambre: bool = False,
-    nivel_juez: str = "Alto",
+    nivel_juez: str = gemini_web.PENSAMIENTO_MEDIO,
 ) -> str:
     """Lanza el ciclo autónomo en un hilo daemon y devuelve confirmación inmediata."""
     origen = (origen_issue_o_pdf or "").strip()
@@ -548,7 +549,7 @@ def iniciar_tarea_autonoma(
         daemon=True,
     )
     hilo.start()
-    modo_txt = f"Enjambre Multi-Cerebro (Juez 4 Argon {nivel_juez})" if usar_enjambre else modelo
+    modo_txt = f"Enjambre Multi-Cerebro (Juez Neo {nivel_juez})" if usar_enjambre else gemini_web.normalizar_nombre_modelo(modelo)
     return (
         f"Listo, ya lancé en segundo plano la resolución autónoma de '{origen}' con {modo_txt}. "
         "Mientras busco el repositorio local, levanto Docker, coordino con Antigravity IDE y audito "
@@ -557,14 +558,31 @@ def iniciar_tarea_autonoma(
 
 
 def consultar_estado_tarea() -> str:
-    """Devuelve la etapa actual o el informe completo si la tarea autónoma ya finalizó."""
+    """Devuelve la etapa actual o el informe completo si la tarea autónoma o el enjambre ya finalizaron."""
+    from . import enjambre_web
+
     estado = _ESTADO_TAREA_AUTONOMA.get("estado", "inactivo")
     etapa = _ESTADO_TAREA_AUTONOMA.get("etapa_actual", "")
     progreso = _ESTADO_TAREA_AUTONOMA.get("progreso", "")
     resumen = _ESTADO_TAREA_AUTONOMA.get("resumen_final", "")
 
+    estado_enj = enjambre_web._ESTADO_ENJAMBRE.get("estado", "inactivo")
+    resultado_enj = enjambre_web._ESTADO_ENJAMBRE.get("resultado", "")
+    etapa_enj = enjambre_web._ESTADO_ENJAMBRE.get("etapa", "")
+
+    if estado == "inactivo" and estado_enj != "inactivo":
+        if estado_enj == "completado" and resultado_enj:
+            return resultado_enj
+        if estado_enj == "en_progreso":
+            return (
+                f"El Enjambre Multi-Cerebro sigue en progreso.\n"
+                f"Etapa actual: {etapa_enj}\n"
+                f"Consulta: {enjambre_web._ESTADO_ENJAMBRE.get('consulta', '')}"
+            )
+        return f"El Enjambre Multi-Cerebro terminó con estado '{estado_enj}': {resultado_enj or etapa_enj}"
+
     if estado == "inactivo":
-        return "No hay ninguna tarea autónoma en ejecución ni completada en esta sesión."
+        return "No hay ninguna tarea autónoma ni deliberación del enjambre en ejecución o completada en esta sesión."
     if estado == "en_progreso":
         return f"Tarea autónoma en progreso.\nEtapa actual: {etapa}\nDetalle: {progreso}"
     if estado == "error":

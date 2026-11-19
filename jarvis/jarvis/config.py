@@ -41,6 +41,10 @@ GEMINI_WEB_URL: str = os.getenv("JARVIS_GEMINI_WEB_URL", "https://gemini.google.
 GEMINI_WEB_CDP: str = os.getenv("JARVIS_EDGE_CDP", "http://127.0.0.1:9222")
 EDGE_PERFIL_JARVIS: str = os.getenv("JARVIS_EDGE_PERFIL", r"C:\EdgeJarvisProfile")
 
+# OpenRouter (cerebro especialista adicional opcional por API para el Enjambre Multi-Cerebro).
+OPENROUTER_API_KEY: str | None = (os.getenv("OPENROUTER_API_KEY") or "").strip() or None
+OPENROUTER_MODEL: str = (os.getenv("OPENROUTER_MODEL") or "openrouter/free").strip() or "openrouter/free"
+
 ARCHIVO_CONTACTOS = RAIZ / "contactos.json"
 ARCHIVO_LOG = RAIZ / "jarvis.log"
 

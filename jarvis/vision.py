@@ -13,10 +13,13 @@ También podés escribir en la terminal y apretar Enter. Para salir, escribí
 "salir" o apretá Ctrl+C.
 """
 import argparse
+from array import array
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import io
+import math
 import os
+import queue
 import re
 import sys
 import threading
@@ -48,21 +51,28 @@ CANALES = 1
 HZ_ENTRADA = 16000
 HZ_SALIDA = 24000
 MUESTRAS_POR_BLOQUE = 2048  # 128 ms de micrófono por envío (menos interrupciones del event loop)
-MUESTRAS_SALIDA_BUFFER = 4096  # buffer de hardware amplio (~170 ms a 24 kHz) para evitar cortes
+MUESTRAS_SALIDA_BUFFER = 2048  # frames_per_buffer=2048 en PyAudio de salida
+# Constantes exactas alineadas a 2 bytes (PCM 16-bit mono a 24000 Hz: 48000 bytes = 1 seg):
+CHUNK_BYTES = 4096             # ~85 ms por escritura, siempre par (% 2 == 0)
+PREBUFFER_BYTES = 21600        # ~450 ms de colchón inicial antes de abrir la frase
+BYTES_BLOQUE_PARLANTE = CHUNK_BYTES
+BYTES_PREBUFFER_SALIDA = PREBUFFER_BYTES
 MAX_CHUNKS_AUDIO_JUNTOS = 24   # agrupa chunks en cola para alimentar el parlante de corrido
-# Jitter buffer de salida: acumula ~150 ms de audio al inicio de cada frase antes de abrir el
-# parlante para absorber variaciones de red y evitar que la voz arranque entrecortada.
-BYTES_PREBUFFER_SALIDA = 7200  # 150 ms a 24 kHz mono 16-bit (48.000 bytes/seg)
-SEGUNDOS_PREBUFFER_MAX = 0.08
+SEGUNDOS_PREBUFFER_TURNO = 0.45
+SEGUNDOS_PREBUFFER_MAX = 0.45
+TIMEOUT_ESPERA_RED_PCM = 0.06  # espera de 60 ms antes de inyectar silencio digital DMA
+WATCHDOG_SILENCIO_PCM_SEG = 0.45  # máximo tiempo sin nuevos chunks reales antes de liberar _reproduciendo_turno
+VENTANA_SILENCIO_AUDIO_SEG = 1.5  # pausa captura de pantalla hasta 1.5s tras el último audio real
+UMBRAL_RMS_BARGE_IN = 650.0
+TIMEOUT_TOOL_CALL_SEG = 5.0       # si una herramienta supera 5s-6s, pasa a segundo plano sin congelar el WebSocket
 
-# Pantalla: como máximo 1 evaluación por segundo. Se manda en resolución nativa hasta 1920x1080
-# (1080p) y JPEG calidad 85 sin submuestreo de color, para que el texto pequeño de interfaces
-# como DBeaver, terminales o el IDE llegue 100% legible. Las pantallas más grandes
-# (2K, 4K) se achican a 1920 px; las más chicas no se agrandan (no suma información).
-SEGUNDOS_ENTRE_CAPTURAS = 1.0
-ANCHO_CAPTURA = 1920
-ALTO_CAPTURA = 1080
-CALIDAD_JPEG = 85
+# Pantalla: intervalo base de 2.5s en reposo. Se redimensiona a un máximo de 1280x720 (720p)
+# y JPEG calidad 70 (~45 KB en vez de ~350 KB), reduciendo un 85% el uso de CPU y ancho de banda
+# de subida en el WebSocket sin perder legibilidad en el código.
+SEGUNDOS_ENTRE_CAPTURAS = 2.5
+ANCHO_CAPTURA = 1280
+ALTO_CAPTURA = 720
+CALIDAD_JPEG = 70
 # Miniatura para detectar cambios (16:9). Con 480x270 se nota hasta una letra tipeada en el editor.
 TAMANO_MINIATURA = (480, 270)
 # Cambio grande (ventana nueva, scroll): se manda enseguida.
@@ -97,6 +107,7 @@ NO_BLOQUEANTES = {
     "buscar_archivos",
     "ejecutar_comando",
     "investigar_a_fondo",
+    "investigar_tema_profundo",
     "leer_video_youtube",
     "ejecutar_wsl",
     "ejecutar_ssh_vm",
@@ -109,6 +120,15 @@ NO_BLOQUEANTES = {
     "consultar_estado_tarea_autonoma",
     "consultar_enjambre_multicerebro",
 }
+
+HERRAMIENTAS_PUENTE_PESADAS = {
+    "consultar_enjambre_multicerebro",
+    "consultar_gemini_pro",
+    "investigar_tema_profundo",
+    "explicar_codigo_en_pantalla",
+    "analizar_repositorio_con_gemini",
+}
+TIMEOUT_HERRAMIENTA_PUENTE = 180.0
 
 SEGUNDOS_ENTRE_INFORMES_DE_TOKENS = 60
 
@@ -147,11 +167,11 @@ REGLA_VISION_TIEMPO_REAL = """REGLA DE VISIÓN EN TIEMPO REAL (PROHIBIDO HABLAR 
 
 PROTOCOLO_CERTEZA_100 = """PROTOCOLO DE CERTEZA 100% (PROHIBIDO IMPROVISAR EN VIVO):
 1. Ante CUALQUIER pregunta general, técnica, teórica o explicación, TIENES PROHIBIDO improvisar de memoria en el canal de voz.
-2. Por defecto, para consultas diarias, preguntas técnicas o explicaciones, ejecutá consultar_gemini_pro(consulta, modelo="4 Hydrogen") (pensamiento Alto).
-3. Cuando el usuario pida explícitamente una "investigación profunda" o "investigar a fondo", ejecutá consultar_gemini_pro(consulta, modelo="3.1 Pro") (pensamiento Alto).
-4. Seleccioná "4 Argon" (intensidad Medio) mediante consultar_gemini_pro(consulta, modelo="4 Argon") ÚNICAMENTE cuando el usuario lo solicite de forma explícita por nombre (por ejemplo, "usá Argon 4" o "4 Argon").
-5. Siempre que el usuario pregunte algo relacionado con su pantalla ("mirá esto", "explicame este error", "ayudame con lo que tengo abierto"), leé los frames actuales y transcribí en el parámetro contexto_pantalla todos los datos visibles (nombre del programa, código, comandos de terminal, tablas o mensajes de error exactos) al invocar consultar_gemini_pro(consulta, modelo=..., contexto_pantalla=...).
-6. PROHIBIDO usar investigar_a_fondo o diagnosticar_y_resolver_con_certeza para responder preguntas teóricas o de investigación: todo el razonamiento e investigación va SIEMPRE por consultar_gemini_pro en Microsoft Edge.
+2. Por defecto, para consultas diarias, preguntas técnicas o explicaciones, ejecutá consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Medio").
+3. Cuando el usuario pida explícitamente una "investigación profunda" o "investigar a fondo", ejecutá investigar_tema_profundo(consulta) o consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Alto").
+4. Cuando el usuario pida investigar cómo configurar, conectar o ejecutar una herramienta técnica, NUNCA respondas de memoria si hay dudas ni abras el navegador visual. Ejecutá primero investigar_a_fondo para leer la documentación oficial completa y los bloques de código reales antes de responder o de usar ejecutar_comando.
+5. Siempre que el usuario pregunte algo relacionado con su pantalla ("mirá esto", "explicame este error", "ayudame con lo que tengo abierto"), leé los frames actuales y transcribí en el parámetro contexto_pantalla todos los datos visibles (nombre del programa, código, comandos de terminal, tablas o mensajes de error exactos) al invocar consultar_gemini_pro(consulta, modelo="Neo", contexto_pantalla=...).
+6. PROHIBIDO usar investigar_a_fondo o diagnosticar_y_resolver_con_certeza para responder preguntas teóricas generales: todo el razonamiento e investigación profunda va SIEMPRE por consultar_gemini_pro o investigar_tema_profundo en Microsoft Edge.
 7. Solo cuando consultar_gemini_pro termine, leéle al usuario la respuesta o los pasos exactos comprobados (1, 2, 3).
 """
 
@@ -161,7 +181,7 @@ AUDITOR = """Eres un auditor de software y código extremadamente riguroso. Tu p
 
 LEY_PRECISION_ABSOLUTA = """
 LEY DE PRECISIÓN ABSOLUTA:
-1. PROHIBIDO ADIVINAR O DAR RODEOS: Nunca respondas a medias ni des explicaciones genéricas de memoria. Para cualquier pregunta general, técnica o explicación usá por defecto consultar_gemini_pro(consulta, modelo="4 Hydrogen"), y si piden "investigación profunda" o "investigar a fondo" usá consultar_gemini_pro(consulta, modelo="3.1 Pro"). No uses nunca investigar_a_fondo ni diagnosticar_y_resolver_con_certeza para preguntas teóricas o de investigación.
+1. PROHIBIDO ADIVINAR O DAR RODEOS: Nunca respondas a medias ni des explicaciones genéricas de memoria. Para cualquier pregunta general, técnica o explicación usá por defecto consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Medio"), y si piden "investigación profunda" o "investigar a fondo" usá investigar_tema_profundo(consulta) o consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Alto").
 2. FORMATO DE RESPUESTA OBLIGATORIO (1, 2, 3): Toda guía o solución debe ser directa y al grano en pasos numerados cortos: Paso 1 qué pestaña o archivo tocar, Paso 2 qué valor o código exacto escribir, Paso 3 qué botón apretar o qué comando ejecutar.
 3. EJECUCIÓN DIRECTA: Si la consulta se resuelve corriendo un comando en Windows, WSL o la VM por SSH, ejecutalo vos misma con tus herramientas o entregá la línea exacta lista para copiar. Interpretá y corregí siempre errores fonéticos del micrófono según el contexto de ingeniería de software."""
 
@@ -169,17 +189,18 @@ ACCIONES = LEY_PRECISION_ABSOLUTA + """
 - Tenés herramientas para actuar en la computadora: abrir programas, carpetas, archivos y páginas web,
   buscar archivos, leer documentos locales, ejecutar comandos, ejecutar_wsl, ejecutar_ssh_vm,
   inspeccionar_pantalla_hd, escribir texto y mandar mensajes de WhatsApp.
-- Para cualquier pregunta general, técnica o explicación usá por defecto consultar_gemini_pro(consulta, modelo="4 Hydrogen").
-- Cuando el usuario pida una "investigación profunda" o "investigar a fondo", usá consultar_gemini_pro(consulta, modelo="3.1 Pro").
+- Para cualquier pregunta general, técnica o explicación usá por defecto consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Medio").
+- Cuando el usuario pida una "investigación profunda" o "investigar a fondo", usá investigar_tema_profundo(consulta) o consultar_gemini_pro(consulta, modelo="Neo", pensamiento="Alto").
 - Siempre que el usuario pregunte algo relacionado con su pantalla ("mirá esto", "explicame este error", "ayudame con lo que tengo abierto"),
   leé los frames actuales y transcribí en contexto_pantalla todos los datos visibles (nombre del programa, código, comandos de terminal,
   tablas o mensajes de error exactos) al invocar consultar_gemini_pro.
-- NUNCA uses investigar_a_fondo ni diagnosticar_y_resolver_con_certeza para responder preguntas teóricas o de investigación.
 - Si te piden "explicame este código", "mirá este código" o "revisá lo que tengo en pantalla", usá explicar_codigo_en_pantalla;
   para analizar un repositorio de GitHub, usá analizar_repositorio_con_gemini.
 - Cuando te pidan resolver un Issue de GitHub o una tarea de un PDF en segundo plano con Antigravity IDE y Docker, usá
   iniciar_tarea_autonoma_issue y seguí conversando normalmente; cuando te pregunten cómo va o si ya terminó, usá consultar_estado_tarea_autonoma.
-- Cuando te pidan usar el enjambre multi-cerebro (DeepSeek + ChatGPT + Juez en Gemini 4 Argon en Alto o Medio), usá consultar_enjambre_multicerebro.
+- Cuando te pidan usar el enjambre multi-cerebro (DeepSeek + ChatGPT + OpenRouter + Juez en Gemini Neo en Medio), usá consultar_enjambre_multicerebro:
+  se inicia de inmediato en segundo plano para que puedas seguir charlando de otros temas, y cuando el usuario pregunte "¿ya terminó el enjambre?"
+  o "¿qué respondió el enjambre?", consultá el veredicto con consultar_estado_tarea_autonoma o consultar_enjambre_multicerebro.
 - Antes de usar una herramienta, decí en una frase qué vas a hacer.
 - Consultar a Gemini Pro, buscar archivos y ejecutar comandos puede tardar: mientras tanto podés seguir charlando, y cuando
   llegue el resultado contalo.
@@ -376,16 +397,20 @@ def hubo_cambio_visual(
     return diferencia_pixeles(actual, anterior) >= umbral
 
 
-def comprimir_jpeg(imagen: Image.Image, ancho_max: int = ANCHO_CAPTURA, calidad: int = CALIDAD_JPEG) -> bytes:
-    """Achica solo si supera 1920 px y comprime en JPEG legible para OCR (calidad 80, color 4:4:4)."""
-    if imagen.width > ancho_max:
-        alto = round(imagen.height * ancho_max / imagen.width)
-        # LANCZOS conserva mejor los bordes de las letras que BILINEAR al achicar 2K/4K.
-        imagen = imagen.resize((ancho_max, alto), Image.Resampling.LANCZOS)
+def comprimir_jpeg(
+    imagen: Image.Image,
+    ancho_max: int = ANCHO_CAPTURA,
+    calidad: int = CALIDAD_JPEG,
+    alto_max: int = ALTO_CAPTURA,
+) -> bytes:
+    """Redimensiona a un máximo de 1280x720 px y comprime en JPEG (calidad 70) liviano para el WebSocket."""
+    if imagen.width > ancho_max or imagen.height > alto_max:
+        escala = min(ancho_max / imagen.width, alto_max / imagen.height)
+        nuevo_ancho = max(1, round(imagen.width * escala))
+        nuevo_alto = max(1, round(imagen.height * escala))
+        imagen = imagen.resize((nuevo_ancho, nuevo_alto), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
-    # subsampling=0: sin submuestreo de color. Con 4:2:0 el texto de color sobre fondo oscuro
-    # (resaltado de sintaxis) queda borroso. Sin optimize, para no gastar CPU de más.
-    imagen.save(buffer, format="JPEG", quality=calidad, subsampling=0)
+    imagen.save(buffer, format="JPEG", quality=calidad)
     return buffer.getvalue()
 
 
@@ -427,9 +452,25 @@ def capturar_frame_si_cambio(
     return comprimir_jpeg(imagen), huella
 
 
-def vaciar(cola: asyncio.Queue) -> None:
+def vaciar(cola) -> None:
     while not cola.empty():
-        cola.get_nowait()
+        try:
+            cola.get_nowait()
+        except (asyncio.QueueEmpty, queue.Empty):
+            break
+
+
+def _energia_rms_pcm16(datos: bytes) -> float:
+    """Calcula la energía RMS de un bloque PCM de 16 bits con signo (mono) sin dependencias externas."""
+    if not datos or len(datos) < 2:
+        return 0.0
+    n = len(datos) // 2
+    muestras = array("h")
+    muestras.frombytes(datos[: n * 2])
+    if sys.byteorder != "little":
+        muestras.byteswap()
+    suma_cuadrados = sum(m * m for m in muestras)
+    return math.sqrt(suma_cuadrados / n)
 
 
 class VisionEnVivo:
@@ -446,7 +487,8 @@ class VisionEnVivo:
         self.cola_envio: asyncio.Queue = asyncio.Queue(maxsize=20)
         # Cola separada para video (capacidad 1): siempre prioriza el último frame y no bloquea el audio.
         self.cola_video: asyncio.Queue = asyncio.Queue(maxsize=1)
-        self.cola_parlante: asyncio.Queue = asyncio.Queue()  # audio de Gemini hacia el parlante
+        # queue.Queue thread-safe consumida por un hilo dedicado exclusivo para PyAudio (anti-underrun).
+        self.cola_parlante: queue.Queue = queue.Queue()
         # Hilos dedicados para que la captura/envío de pantalla nunca compita con el audio bidireccional.
         self._ejecutor_microfono = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jarvis-mic")
         self._ejecutor_parlante = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jarvis-parlante")
@@ -455,6 +497,14 @@ class VisionEnVivo:
         self.conecto_alguna_vez = False  # si nunca conectó, el error es de configuración: no se reintenta
         self.hablando = False       # Gemini está generando una respuesta
         self.reproduciendo = False  # El parlante sigue emitiendo audio en el hilo dedicado
+        self._lucy_hablando = False
+        self._buffer_pcm: bytearray = bytearray()
+        self._byte_impar_pendiente: bytearray = bytearray()
+        self._reproduciendo_turno = False
+        self._turno_completado_remoto = False
+        self._inicio_turno_voz = True
+        self._ultimo_ingreso_pcm_ts: float = 0.0  # timestamp del último chunk REAL de voz ingresado en cola_parlante
+        self._ultimo_chunk_audio_ts: float = 0.0  # timestamp monotónico del último chunk de voz recibido/reproducido
         self.cortar_pronto = False  # llegó un go_away
         self.saludo_hecho = False   # el saludo inicial va solo en la primera conexión
         self.forzar_captura = True  # envía un frame fresco al conectar y tras cada fin de turno
@@ -465,6 +515,7 @@ class VisionEnVivo:
         self.confirmando = False
         self.respuesta_confirmacion: asyncio.Future | None = None
         self.herramientas_en_curso = 0  # no se reconecta con una herramienta a medio responder
+        self._herramienta_pesada_activa = False  # pausa envío de frames 1920x1080 mientras corre el puente web
         self.id_en_curso: str | None = None   # llamada que se está ejecutando (o confirmando)
         self.cancelados: set[str] = set()      # llamadas que Gemini canceló antes de ejecutarse
         self.tokens = 0
@@ -500,17 +551,44 @@ class VisionEnVivo:
         if isinstance(self.cliente, genai.Client):
             self.cliente = crear_cliente()
 
+    def lucy_hablando_reciente(self) -> bool:
+        """True si llegó o se reprodujo audio de Gemini Live hace menos de 1.5 segundos."""
+        if self._ultimo_chunk_audio_ts <= 0.0:
+            return False
+        reciente = (time.monotonic() - self._ultimo_chunk_audio_ts) < VENTANA_SILENCIO_AUDIO_SEG
+        self._lucy_hablando = reciente or self.hablando or self.reproduciendo or self._reproduciendo_turno
+        return reciente
+
+    def _lucy_esta_hablando(self) -> bool:
+        """True mientras _reproduciendo_turno sea True, haya bytes en buffer_pcm/cola o pasaron < 1.5s."""
+        return (
+            self._reproduciendo_turno
+            or len(self._buffer_pcm) > 0
+            or not self.cola_parlante.empty()
+            or self.hablando
+            or self.reproduciendo
+            or self.lucy_hablando_reciente()
+        )
+
     def audio_en_curso(self) -> bool:
-        """True mientras Gemini envía voz o el parlante todavía está reproduciendo el buffer."""
-        return self.hablando or self.reproduciendo or not self.cola_parlante.empty()
+        """True mientras Gemini envía voz, el parlante reproduce o no pasaron 1.5s desde el último chunk."""
+        return self._lucy_esta_hablando()
 
     def limpiar_sesion(self, descartar_handle: bool = False) -> None:
         """Limpia colas y estado de la instancia anterior; si la sesión expiró, limpia handle y cliente."""
         vaciar(self.cola_envio)
         vaciar(self.cola_video)
         vaciar(self.cola_parlante)
+        self._buffer_pcm.clear()
+        self._byte_impar_pendiente.clear()
         self.hablando = False
         self.reproduciendo = False
+        self._lucy_hablando = False
+        self._reproduciendo_turno = False
+        self._turno_completado_remoto = False
+        self._inicio_turno_voz = True
+        self._ultimo_ingreso_pcm_ts = 0.0
+        self._ultimo_chunk_audio_ts = 0.0
         self.cortar_pronto = False
         self.forzar_captura = True
         self.dicho_usuario.clear()
@@ -522,7 +600,7 @@ class VisionEnVivo:
 
     def encolar_video(self, jpeg: bytes) -> None:
         """Pone el fotograma más reciente en la cola de video sin acumular fotogramas viejos."""
-        if self.confirmando:
+        if self.confirmando or self._herramienta_pesada_activa:
             return
         vaciar(self.cola_video)
         try:
@@ -584,6 +662,8 @@ class VisionEnVivo:
         print("🎧 Usá auriculares: si no, el micrófono capta la voz de Gemini y se interrumpe sola.")
         if self.con_herramientas:
             seguridad.registrar_confirmador(self.confirmar_por_terminal)
+            if getattr(herramientas.config, "GEMINI_WEB_ACTIVO", False):
+                herramientas.gemini_web.precalentar_puente()
             print("🛠️ Lucy puede usar herramientas. Lo que necesite permiso se confirma acá, por escrito.")
         print('Hablá, o escribí y apretá Enter. "salir" o Ctrl+C para terminar.\n')
         try:
@@ -633,6 +713,32 @@ class VisionEnVivo:
         if texto:
             await self.cola_envio.put(("texto", texto))
 
+    def procesar_chunk_microfono(self, bloque: bytes) -> bytes:
+        """Filtra eco/ruido con silencio PCM mientras Lucy habla o corta su voz ante barge-in real."""
+        if not bloque:
+            return bloque
+        ahora = time.monotonic()
+        habla_activa = (
+            self._reproduciendo_turno
+            and self._ultimo_ingreso_pcm_ts > 0.0
+            and (ahora - self._ultimo_ingreso_pcm_ts) < WATCHDOG_SILENCIO_PCM_SEG
+        )
+        if not habla_activa:
+            return bloque
+        if _energia_rms_pcm16(bloque) >= UMBRAL_RMS_BARGE_IN:
+            # Barge-in real del usuario: cortar reproducción actual y enviar su voz real
+            vaciar(self.cola_parlante)
+            self._buffer_pcm.clear()
+            self._byte_impar_pendiente.clear()
+            self._reproduciendo_turno = False
+            self._turno_completado_remoto = False
+            self.reproduciendo = False
+            self.hablando = False
+            self._lucy_hablando = False
+            return bloque
+        # Eco o ruido ambiente bajo mientras Lucy habla: enviar silencio digital para mantener vivo el stream
+        return b"\x00" * len(bloque)
+
     async def leer_microfono(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
@@ -640,63 +746,51 @@ class VisionEnVivo:
                 self._ejecutor_microfono,
                 lambda: self.microfono.read(MUESTRAS_POR_BLOQUE, exception_on_overflow=False),
             )
+            paquete = self.procesar_chunk_microfono(bloque)
             try:
-                self.cola_envio.put_nowait(("audio", bloque))
+                self.cola_envio.put_nowait(("audio", paquete))
             except asyncio.QueueFull:
                 pass  # conexión trabada: mejor perder 64 ms de audio que acumular atraso
 
     async def capturar_pantalla(self) -> None:
-        """Corre la captura (mss) y el procesamiento de imagen en un hilo totalmente separado del audio."""
-        loop = asyncio.get_running_loop()
-        parar = threading.Event()
-
-        def ciclo_captura() -> None:
-            anterior: bytes | None = None
-            enviada_en = 0.0
-            sct = None
-            try:
-                sct = mss.MSS()
-            except Exception:
-                sct = None
-            try:
-                while not parar.is_set():
-                    # Mientras se confirma o mientras entra/sale audio de Gemini, no procesamos imagen
-                    # para no disputar el GIL ni el WebSocket con la reproducción de voz.
-                    if not self.confirmando and not self.audio_en_curso():
-                        try:
-                            # Los cambios chicos (una letra corregida) también se mandan, pero como
-                            # mucho cada SEGUNDOS_REFRESCO_CAMBIO_CHICO, para que Lucy no revise
-                            # una versión vieja del código sin saturar el WebSocket. Además, al
-                            # iniciar un turno nuevo (forzar_captura) o tras SEGUNDOS_LATIDO_PANTALLA,
-                            # se refresca aunque la pantalla esté quieta para que Gemini siempre tenga
-                            # la captura actual en el turno activo.
-                            ahora = time.monotonic()
-                            if self.forzar_captura or (ahora - enviada_en >= SEGUNDOS_LATIDO_PANTALLA):
-                                anterior = None
-                                self.forzar_captura = False
-                            chico = ahora - enviada_en >= SEGUNDOS_REFRESCO_CAMBIO_CHICO
-                            jpeg, anterior = capturar_frame_si_cambio(sct, anterior, chico)
-                            if jpeg is not None:
-                                enviada_en = ahora
-                                loop.call_soon_threadsafe(self.encolar_video, jpeg)
-                        except RuntimeError:
-                            return
-                        except Exception:
-                            pass
-                    parar.wait(SEGUNDOS_ENTRE_CAPTURAS)
-            finally:
-                if sct is not None:
+        """Captura y comprime la pantalla (1280x720, JPEG 70) en asyncio.to_thread cada 2.5s en reposo."""
+        anterior: bytes | None = None
+        enviada_en = 0.0
+        sct = None
+        try:
+            while True:
+                # Mientras _lucy_esta_hablando() sea True (< 1.8s del último audio o cola no vacía),
+                # NO capturamos pantalla con mss ni ejecutamos compresión JPEG con Pillow.
+                if (
+                    not self.confirmando
+                    and not self._lucy_esta_hablando()
+                    and not self._herramienta_pesada_activa
+                ):
                     try:
-                        sct.close()
+                        ahora = time.monotonic()
+                        if self.forzar_captura or (ahora - enviada_en >= SEGUNDOS_LATIDO_PANTALLA):
+                            anterior = None
+                            self.forzar_captura = False
+                        chico = ahora - enviada_en >= SEGUNDOS_REFRESCO_CAMBIO_CHICO
+                        jpeg, anterior = await asyncio.to_thread(
+                            capturar_frame_si_cambio, None, anterior, chico
+                        )
+                        if (
+                            jpeg is not None
+                            and not self._lucy_esta_hablando()
+                            and not self._herramienta_pesada_activa
+                        ):
+                            enviada_en = ahora
+                            self.encolar_video(jpeg)
                     except Exception:
                         pass
-
-        hilo = threading.Thread(target=ciclo_captura, name="jarvis-captura-pantalla", daemon=True)
-        hilo.start()
-        try:
-            await asyncio.Future()
+                await asyncio.sleep(SEGUNDOS_ENTRE_CAPTURAS)
         finally:
-            parar.set()
+            if sct is not None:
+                try:
+                    sct.close()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------- confirmaciones
 
@@ -791,13 +885,12 @@ class VisionEnVivo:
         """Envía los fotogramas de pantalla sin bloquear nunca la recepción ni reproducción de audio."""
         while True:
             jpeg = await self.cola_video.get()
-            # No enviar video mientras Gemini está hablando o el parlante reproduce: evita bloquear
-            # el loop del WebSocket y evita que el servidor pause la generación de voz.
-            while self.audio_en_curso() and not self.confirmando:
+            # No enviar video mientras Gemini está hablando, el parlante reproduce o corre una herramienta pesada.
+            while (self.audio_en_curso() or self._herramienta_pesada_activa) and not self.confirmando:
                 await asyncio.sleep(0.05)
                 if not self.cola_video.empty():
                     jpeg = self.cola_video.get_nowait()
-            if self.confirmando:
+            if self.confirmando or self._herramienta_pesada_activa:
                 continue
             ancho, alto = resolucion_jpeg(jpeg)
             print(f"📸 [DEBUG] Frame enviado por WebSocket: {ancho}x{alto} px ({len(jpeg) // 1024} KB)")
@@ -842,6 +935,31 @@ class VisionEnVivo:
         finally:
             self.herramientas_en_curso -= 1
 
+    @staticmethod
+    def _registrar_resultado_en_segundo_plano(nombre_funcion: str, argumentos: dict, futuro: asyncio.Future) -> None:
+        """Guarda en _ESTADO_ENJAMBRE / _ESTADO_TAREA_AUTONOMA el resultado cuando termina una herramienta lenta."""
+        try:
+            res = str(futuro.result())
+        except Exception as e:
+            res = f"Error en {nombre_funcion} ({type(e).__name__}: {e})"
+        try:
+            from jarvis import enjambre_web, orquestador_autonomo
+            enjambre_web._ESTADO_ENJAMBRE.update({
+                "estado": "completado",
+                "consulta": str(argumentos.get("consulta") or nombre_funcion),
+                "etapa": "Completado",
+                "resultado": res,
+            })
+            if orquestador_autonomo._ESTADO_TAREA_AUTONOMA.get("estado") == "inactivo":
+                orquestador_autonomo._ESTADO_TAREA_AUTONOMA.update({
+                    "estado": "completado",
+                    "etapa_actual": "Completado",
+                    "progreso": f"Herramienta {nombre_funcion} finalizada en segundo plano.",
+                    "resumen_final": res,
+                })
+        except Exception:
+            pass
+
     async def ejecutar_llamadas(self, llamada: types.LiveServerToolCall) -> list[types.FunctionResponse]:
         respuestas = []
         async with self.candado_herramientas:
@@ -852,10 +970,38 @@ class VisionEnVivo:
                 argumentos = dict(funcion.args or {})
                 print(f"\n🛠️ Lucy usa {funcion.name} {argumentos}")
                 self.id_en_curso = funcion.id
+                es_pesada = funcion.name in HERRAMIENTAS_PUENTE_PESADAS
+                if es_pesada:
+                    self._herramienta_pesada_activa = True
                 try:
-                    # ejecutar() bloquea (un comando puede tardar 120 s): en un hilo, para no trabar el audio.
-                    resultado = await asyncio.to_thread(herramientas.ejecutar, funcion.name, argumentos)
+                    tarea = asyncio.create_task(
+                        asyncio.to_thread(herramientas.ejecutar, funcion.name, argumentos)
+                    )
+                    terminadas, _ = await asyncio.wait({tarea}, timeout=TIMEOUT_TOOL_CALL_SEG)
+                    # Si está esperando confirmación escrita en la terminal, esperamos a que el usuario responda.
+                    while not terminadas and self.confirmando:
+                        terminadas, _ = await asyncio.wait({tarea}, timeout=0.5)
+
+                    if terminadas:
+                        resultado = await tarea
+                    else:
+                        # Superó los 5.0 segundos: queda corriendo en segundo plano sin congelar el WebSocket.
+                        tarea.add_done_callback(
+                            lambda fut, n=funcion.name, a=argumentos: self._registrar_resultado_en_segundo_plano(n, a, fut)
+                        )
+                        resultado = (
+                            f"La herramienta '{funcion.name}' superó los {TIMEOUT_TOOL_CALL_SEG:.0f} segundos y "
+                            "quedó procesando en segundo plano para no bloquear tu voz. "
+                            "El micrófono sigue libre y podés consultar el resultado con consultar_estado_tarea_autonoma."
+                        )
+                except Exception as e:
+                    detalle = f"{type(e).__name__}: {e}"
+                    print(f"\n⚠️ Error en {funcion.name} ({detalle})")
+                    resultado = f"Error en {funcion.name} ({detalle})"
                 finally:
+                    if es_pesada:
+                        self._herramienta_pesada_activa = False
+                        self.forzar_captura = True
                     self.id_en_curso = None
                 print(f"   → {resultado[:300]}")
                 respuestas.append(self.respuesta(funcion, resultado))
@@ -895,18 +1041,36 @@ class VisionEnVivo:
         entro_audio = False
         if contenido.interrupted:  # el usuario habló encima: callar lo que quedaba
             vaciar(self.cola_parlante)
+            self._buffer_pcm.clear()
+            self._byte_impar_pendiente.clear()
+            self._reproduciendo_turno = False
+            self._turno_completado_remoto = False
+            self._lucy_hablando = False
+            self._inicio_turno_voz = True
+            self._ultimo_ingreso_pcm_ts = 0.0
+            self._ultimo_chunk_audio_ts = 0.0
         if contenido.model_turn:
             for parte in contenido.model_turn.parts or []:
                 if parte.inline_data and parte.inline_data.data:
+                    if self._turno_completado_remoto and not self._reproduciendo_turno:
+                        self._turno_completado_remoto = False
+                    ahora_pcm = time.monotonic()
+                    self._ultimo_ingreso_pcm_ts = ahora_pcm
+                    self._ultimo_chunk_audio_ts = ahora_pcm
                     self.cola_parlante.put_nowait(parte.inline_data.data)
                     self.hablando = True
+                    self._lucy_hablando = True
                     entro_audio = True
         if contenido.input_transcription and contenido.input_transcription.text:
             self.dicho_usuario.append(contenido.input_transcription.text)
         if contenido.output_transcription and contenido.output_transcription.text:
             self.dicho_gemini.append(contenido.output_transcription.text)
+        if contenido.turn_complete:
+            self._turno_completado_remoto = True
         if contenido.turn_complete or contenido.interrupted:
             self.hablando = False
+            self._lucy_hablando = False
+            self._inicio_turno_voz = True
             self.forzar_captura = True
             self.mostrar_transcripcion(interrumpido=bool(contenido.interrupted))
         return entro_audio
@@ -934,47 +1098,191 @@ class VisionEnVivo:
                 while not self.cola_parlante.empty() and len(siguientes) < MAX_CHUNKS_AUDIO_JUNTOS:
                     try:
                         siguientes.append(self.cola_parlante.get_nowait())
-                    except asyncio.QueueEmpty:
+                    except (asyncio.QueueEmpty, queue.Empty):
                         break
                 actual = b"".join(siguientes) if siguientes else b""
         finally:
             if self.cola_parlante.empty():
                 self.reproduciendo = False
 
-    async def reproducir_audio(self) -> None:
-        """Consume de cola_parlante con pre-buffering (jitter buffer) y drenado continuo sin tartamudeo."""
-        loop = asyncio.get_running_loop()
-        while True:
-            primero = await self.cola_parlante.get()
-            trozos = [primero]
-            bytes_acumulados = len(primero)
+    def _drenar_cola_a_buffer_alineado(self) -> bool:
+        """Drena cola_parlante hacia _buffer_pcm con get_nowait() y garantiza longitud par (% 2 == 0)."""
+        ingreso = False
+        if self._byte_impar_pendiente and not self.cola_parlante.empty():
+            self._buffer_pcm.extend(self._byte_impar_pendiente)
+            self._byte_impar_pendiente.clear()
 
-            # Jitter pre-buffer: al arrancar una frase nueva, espera hasta SEGUNDOS_PREBUFFER_MAX
-            # para juntar ~150 ms de audio antes de abrir el parlante y evitar cortes entre sílabas.
-            inicio_espera = time.monotonic()
-            while (
-                self.hablando
-                and bytes_acumulados < BYTES_PREBUFFER_SALIDA
-                and (time.monotonic() - inicio_espera) < SEGUNDOS_PREBUFFER_MAX
-            ):
-                if not self.cola_parlante.empty():
-                    try:
-                        chunk = self.cola_parlante.get_nowait()
-                        trozos.append(chunk)
-                        bytes_acumulados += len(chunk)
-                        continue
-                    except asyncio.QueueEmpty:
-                        pass
-                await asyncio.sleep(0.01)
+        while not self.cola_parlante.empty():
+            try:
+                chunk = self.cola_parlante.get_nowait()
+                if chunk:
+                    if self._byte_impar_pendiente:
+                        self._buffer_pcm.extend(self._byte_impar_pendiente)
+                        self._byte_impar_pendiente.clear()
+                    self._buffer_pcm.extend(chunk)
+                    self._ultimo_ingreso_pcm_ts = time.monotonic()
+                    ingreso = True
+            except (asyncio.QueueEmpty, queue.Empty):
+                break
 
-            while not self.cola_parlante.empty() and len(trozos) < MAX_CHUNKS_AUDIO_JUNTOS:
+        # b) Si len(buffer_pcm) % 2 != 0, conserva el último byte suelto para el siguiente ciclo.
+        if len(self._buffer_pcm) % 2 != 0:
+            self._byte_impar_pendiente.append(self._buffer_pcm[-1])
+            del self._buffer_pcm[-1]
+        return ingreso
+
+    def _bucle_hilo_parlante(self, parar: threading.Event) -> None:
+        """Motor de Audio Continuo con alineación PCM de 16-bit (% 2 == 0) y silencio digital DMA."""
+        buffer_pcm = self._buffer_pcm
+        primer_byte_ts: float = 0.0
+
+        while not parar.is_set():
+            # a) y b) Drenar chunks disponibles con get_nowait() manteniendo alineación par de 16 bits
+            self._drenar_cola_a_buffer_alineado()
+
+            if not buffer_pcm and not self._reproduciendo_turno:
+                if self._turno_completado_remoto and self.cola_parlante.empty():
+                    self._turno_completado_remoto = False
                 try:
-                    trozos.append(self.cola_parlante.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            bloque = b"".join(trozos) if len(trozos) > 1 else primero
-            self.reproduciendo = True
-            await loop.run_in_executor(self._ejecutor_parlante, self._drenar_en_parlante, bloque)
+                    primero = self.cola_parlante.get(timeout=0.02)
+                except queue.Empty:
+                    self.reproduciendo = False
+                    continue
+                if primero:
+                    if self._byte_impar_pendiente:
+                        buffer_pcm.extend(self._byte_impar_pendiente)
+                        self._byte_impar_pendiente.clear()
+                    buffer_pcm.extend(primero)
+                    if len(buffer_pcm) % 2 != 0:
+                        self._byte_impar_pendiente.append(buffer_pcm[-1])
+                        del buffer_pcm[-1]
+                ahora_ingreso = time.monotonic()
+                primer_byte_ts = ahora_ingreso
+                self._ultimo_ingreso_pcm_ts = ahora_ingreso
+                self._drenar_cola_a_buffer_alineado()
+
+            # c) Fase de arranque de frase: espera PREBUFFER_BYTES (21600), _turno_completado_remoto o 0.45s
+            if not self._reproduciendo_turno:
+                if not buffer_pcm and not self._turno_completado_remoto:
+                    continue
+                if primer_byte_ts <= 0.0:
+                    primer_byte_ts = time.monotonic()
+                if (
+                    len(buffer_pcm) >= PREBUFFER_BYTES
+                    or self._turno_completado_remoto
+                    or (time.monotonic() - primer_byte_ts) >= SEGUNDOS_PREBUFFER_TURNO
+                ):
+                    self._reproduciendo_turno = True
+                    self._inicio_turno_voz = False
+                    self.reproduciendo = True
+                else:
+                    try:
+                        chunk = self.cola_parlante.get(timeout=0.01)
+                        if chunk:
+                            if self._byte_impar_pendiente:
+                                buffer_pcm.extend(self._byte_impar_pendiente)
+                                self._byte_impar_pendiente.clear()
+                            buffer_pcm.extend(chunk)
+                            if len(buffer_pcm) % 2 != 0:
+                                self._byte_impar_pendiente.append(buffer_pcm[-1])
+                                del buffer_pcm[-1]
+                    except queue.Empty:
+                        pass
+                    continue
+
+            # d) Fase de reproducción fluida: escribir bloques de CHUNK_BYTES (4096) de corrido
+            while len(buffer_pcm) >= CHUNK_BYTES:
+                self.reproduciendo = True
+                bloque = bytes(buffer_pcm[:CHUNK_BYTES])
+                del buffer_pcm[:CHUNK_BYTES]
+                self.parlante.write(bloque)
+                self._ultimo_chunk_audio_ts = time.monotonic()
+                self._drenar_cola_a_buffer_alineado()
+
+            # e) Si _reproduciendo_turno es True y buffer_pcm tiene menos de CHUNK_BYTES (4096):
+            if self._reproduciendo_turno and len(buffer_pcm) < CHUNK_BYTES:
+                self._drenar_cola_a_buffer_alineado()
+                if len(buffer_pcm) >= CHUNK_BYTES:
+                    continue
+
+                if self._turno_completado_remoto and self.cola_parlante.empty():
+                    if len(buffer_pcm) > 0:
+                        if len(buffer_pcm) % 2 != 0:
+                            del buffer_pcm[-1]
+                        relleno = CHUNK_BYTES - len(buffer_pcm)
+                        bloque_final = bytes(buffer_pcm) + (b"\x00" * max(0, relleno))
+                        self.parlante.write(bloque_final)
+                        self._ultimo_chunk_audio_ts = time.monotonic()
+                    buffer_pcm.clear()
+                    self._byte_impar_pendiente.clear()
+                    self._reproduciendo_turno = False
+                    self._turno_completado_remoto = False
+                    self.reproduciendo = False
+                    primer_byte_ts = 0.0
+                else:
+                    # Todavía viajan paquetes por red: esperar hasta 0.06s; si no llegan, verificar Watchdog (0.45s)
+                    try:
+                        nuevo = self.cola_parlante.get(timeout=TIMEOUT_ESPERA_RED_PCM)
+                        if nuevo:
+                            self._ultimo_ingreso_pcm_ts = time.monotonic()
+                            if self._byte_impar_pendiente:
+                                buffer_pcm.extend(self._byte_impar_pendiente)
+                                self._byte_impar_pendiente.clear()
+                            buffer_pcm.extend(nuevo)
+                            if len(buffer_pcm) % 2 != 0:
+                                self._byte_impar_pendiente.append(buffer_pcm[-1])
+                                del buffer_pcm[-1]
+                        self._drenar_cola_a_buffer_alineado()
+                    except queue.Empty:
+                        if self._turno_completado_remoto and self.cola_parlante.empty():
+                            continue
+                        inactivo_seg = (
+                            (time.monotonic() - self._ultimo_ingreso_pcm_ts)
+                            if self._ultimo_ingreso_pcm_ts > 0.0
+                            else WATCHDOG_SILENCIO_PCM_SEG + 1.0
+                        )
+                        if len(buffer_pcm) == 0 and inactivo_seg > WATCHDOG_SILENCIO_PCM_SEG:
+                            # Watchdog Anti-Bloqueo: pasaron > 0.45s sin audio real -> liberar estado de habla
+                            self._byte_impar_pendiente.clear()
+                            self._reproduciendo_turno = False
+                            self._turno_completado_remoto = False
+                            self.reproduciendo = False
+                            self.hablando = False
+                            self._lucy_hablando = False
+                            primer_byte_ts = 0.0
+                            continue
+                        if len(buffer_pcm) > 0 and inactivo_seg > WATCHDOG_SILENCIO_PCM_SEG:
+                            if len(buffer_pcm) % 2 != 0:
+                                del buffer_pcm[-1]
+                            relleno = CHUNK_BYTES - len(buffer_pcm)
+                            self.parlante.write(bytes(buffer_pcm) + (b"\x00" * max(0, relleno)))
+                            buffer_pcm.clear()
+                            self._byte_impar_pendiente.clear()
+                            self._reproduciendo_turno = False
+                            self._turno_completado_remoto = False
+                            self.reproduciendo = False
+                            self.hablando = False
+                            self._lucy_hablando = False
+                            primer_byte_ts = 0.0
+                            continue
+                        if not parar.is_set():
+                            # Inyecta silencio DMA SIN actualizar _ultimo_ingreso_pcm_ts
+                            self.parlante.write(b"\x00" * CHUNK_BYTES)
+
+    async def reproducir_audio(self) -> None:
+        """Mantiene vivo el hilo dedicado del parlante durante toda la sesión."""
+        parar = threading.Event()
+        hilo = threading.Thread(
+            target=self._bucle_hilo_parlante,
+            args=(parar,),
+            name="jarvis-hilo-parlante",
+            daemon=True,
+        )
+        hilo.start()
+        try:
+            await asyncio.Future()
+        finally:
+            parar.set()
 
 
 def main() -> None:

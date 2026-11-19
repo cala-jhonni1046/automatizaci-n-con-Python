@@ -751,3 +751,120 @@ def test_drenar_en_parlante_reproduce_continuo_y_bloquea_video_mientras_suena():
     assert escritos == [b"chunk-A-", b"chunk-B-chunk-C"]
     assert v.reproduciendo is False
     assert v.audio_en_curso() is False
+
+
+def test_jitter_buffer_queue_pausa_0_8s_y_compresion_720p_calidad_70():
+    import queue as _q
+    from PIL import Image
+    from jarvis import gemini_web
+
+    # 1) Constantes alineadas a 2 bytes (PCM 16-bit 24000 Hz) y captura liviana (1280x720, calidad 70)
+    assert vision.CHUNK_BYTES == 4096
+    assert vision.PREBUFFER_BYTES == 21600
+    assert vision.CHUNK_BYTES % 2 == 0 and vision.PREBUFFER_BYTES % 2 == 0
+    assert vision.ANCHO_CAPTURA == 1280
+    assert vision.ALTO_CAPTURA == 720
+    assert vision.CALIDAD_JPEG == 70
+    assert vision.SEGUNDOS_ENTRE_CAPTURAS == 2.5
+    assert vision.MUESTRAS_SALIDA_BUFFER == 2048
+    assert vision.VENTANA_SILENCIO_AUDIO_SEG == 1.5
+    assert gemini_web.SEGUNDOS_ESPERA_PRECALENTAR == 4.0
+
+    img_full = Image.new("RGB", (1920, 1080), color=(30, 40, 50))
+    jpeg_liviano = vision.comprimir_jpeg(img_full)
+    assert vision.resolucion_jpeg(jpeg_liviano) == (1280, 720)
+    assert len(jpeg_liviano) < 60_000  # muy liviano (< 60 KB)
+
+    # 2) Alineación par (% 2 == 0) y arranque inmediato de respuesta corta al llegar turn_complete
+    escritos = []
+    parar = threading.Event()
+
+    class ParlanteFalso:
+        def write(self, datos: bytes):
+            # Jamás debe recibir un número impar de bytes (evita chasquidos PCM 16-bit)
+            assert len(datos) % 2 == 0
+            escritos.append(datos)
+            if len(escritos) >= 2:
+                parar.set()
+
+    v = vision.VisionEnVivo(cliente=None, microfono=None, parlante=ParlanteFalso(), con_video=True)
+    assert isinstance(v.cola_parlante, _q.Queue)
+
+    # Simulamos 2 chunks con longitudes IMPARES (2501 + 2499 = 5000 bytes) + turn_complete
+    chunk_impar_1 = b"A" * 2501
+    chunk_impar_2 = b"B" * 2499
+    p1 = types.Part(inline_data=types.Blob(data=chunk_impar_1, mime_type="audio/pcm"))
+    p2 = types.Part(inline_data=types.Blob(data=chunk_impar_2, mime_type="audio/pcm"))
+    v.procesar(types.LiveServerContent(model_turn=types.Content(parts=[p1, p2]), turn_complete=True))
+    assert v._turno_completado_remoto is True
+    assert v._lucy_esta_hablando() is True
+
+    v._bucle_hilo_parlante(parar)
+    # 1er bloque: 4096 bytes exactos; 2do bloque: 904 bytes + 3192 bytes de silencio = 4096 bytes
+    assert len(escritos) == 2
+    assert len(escritos[0]) == vision.CHUNK_BYTES
+    assert len(escritos[1]) == vision.CHUNK_BYTES
+    assert (escritos[0] + escritos[1])[:5000] == (chunk_impar_1 + chunk_impar_2)
+    assert (escritos[0] + escritos[1])[5000:] == b"\x00" * (8192 - 5000)
+    assert v._reproduciendo_turno is False
+    assert v._turno_completado_remoto is False
+    assert len(v._buffer_pcm) == 0
+
+
+def test_watchdog_0_45s_libera_reproduciendo_turno_sin_turn_complete_y_mic_nunca_muere(monkeypatch):
+    from array import array
+
+    escritos = []
+    parar = threading.Event()
+
+    class ParlanteWatchdog:
+        def write(self, datos: bytes):
+            escritos.append(datos)
+            # En cuanto haya escrito el bloque de audio real, adelantamos _ultimo_ingreso_pcm_ts > 0.45s
+            # para comprobar que el watchdog libera _reproduciendo_turno sin turn_complete
+            v._ultimo_ingreso_pcm_ts = vision.time.monotonic() - 0.50
+
+    v = vision.VisionEnVivo(cliente=None, microfono=None, parlante=ParlanteWatchdog(), con_video=True)
+    monkeypatch.setattr(vision, "TIMEOUT_ESPERA_RED_PCM", 0.01)
+
+    # Ingresamos un bloque de 4096 bytes SIN turn_complete (_turno_completado_remoto=False)
+    bloque_voz = b"V" * vision.CHUNK_BYTES
+    parte = types.Part(inline_data=types.Blob(data=bloque_voz, mime_type="audio/pcm"))
+    v.procesar(types.LiveServerContent(model_turn=types.Content(parts=[parte]), turn_complete=False))
+    v._reproduciendo_turno = True
+
+    def cortar_al_liberar():
+        limite = vision.time.monotonic() + 2.0
+        while vision.time.monotonic() < limite:
+            if not v._reproduciendo_turno:
+                parar.set()
+                return
+            vision.time.sleep(0.01)
+        parar.set()
+
+    hilo_vigia = threading.Thread(target=cortar_al_liberar, daemon=True)
+    hilo_vigia.start()
+    v._bucle_hilo_parlante(parar)
+    hilo_vigia.join(timeout=1.0)
+
+    # Se liberó automáticamente por el watchdog de 0.45s aunque nunca llegó turn_complete
+    assert v._reproduciendo_turno is False
+    assert v._turno_completado_remoto is False
+
+    # 2) Micrófono nunca muere: envía silencio digital con eco bajo y corta con voz fuerte (barge-in)
+    v._reproduciendo_turno = True
+    v._ultimo_ingreso_pcm_ts = vision.time.monotonic()
+    v._buffer_pcm.extend(b"1234")
+
+    eco_bajo = array("h", [15, -15] * 256).tobytes()
+    paquete_silencio = v.procesar_chunk_microfono(eco_bajo)
+    assert paquete_silencio == b"\x00" * len(eco_bajo)
+    assert v._reproduciendo_turno is True
+
+    voz_usuario = array("h", [3000, -3000] * 256).tobytes()
+    paquete_voz = v.procesar_chunk_microfono(voz_usuario)
+    assert paquete_voz == voz_usuario
+    assert v._reproduciendo_turno is False
+    assert len(v._buffer_pcm) == 0
+
+
